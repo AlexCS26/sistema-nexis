@@ -18,7 +18,14 @@ const monturaRoute = require("./src/users/almacen_service/montura_service/routes
 dotenv.config();
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: "http://localhost:5173", credentials: true }));
+
+// Configuración de CORS con variables de entorno
+const corsOptions = {
+  origin: process.env.CLIENT_ORIGIN || "http://localhost:5173",
+  credentials: true,
+  optionsSuccessStatus: 200, // Para navegadores más antiguos
+};
+app.use(cors(corsOptions));
 
 // Conectar a la base de datos
 connectDB();
