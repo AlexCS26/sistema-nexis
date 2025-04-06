@@ -94,6 +94,7 @@ function formatDioptria(value) {
   if (isNaN(num)) return "0.00";
   return num >= 0 ? `+${num.toFixed(2)}` : num.toFixed(2);
 }
+
 const registrarLuna = async (req, res) => {
   try {
     console.log("🔹 Iniciando registro de luna...");
@@ -108,7 +109,7 @@ const registrarLuna = async (req, res) => {
       );
     }
 
-    const { esferico, cilindrico, tipo, stock, ot } = req.body;
+    const { esferico, cilindrico, tipo, stock, ot, zona } = req.body;
     const registradoPor = req.usuario.userId;
 
     console.log("📌 Datos recibidos:", {
@@ -117,6 +118,7 @@ const registrarLuna = async (req, res) => {
       tipo,
       ot,
       stock,
+      zona,
       registradoPor,
     });
 
@@ -127,6 +129,15 @@ const registrarLuna = async (req, res) => {
         res,
         400,
         "Debe proporcionar al menos un valor para esférico o cilíndrico."
+      );
+    }
+
+    if (!zona) {
+      console.warn("❌ Falta especificar la zona (Chancay o Huaral).");
+      return errorResponse(
+        res,
+        400,
+        "La zona (Chancay o Huaral) es obligatoria."
       );
     }
 
@@ -155,6 +166,7 @@ const registrarLuna = async (req, res) => {
       cilindrico,
       tipo,
       ot,
+      zona, // Ahora también consideramos la zona en la búsqueda
     });
 
     if (lunaExistente) {
@@ -191,8 +203,8 @@ const registrarLuna = async (req, res) => {
         statusCode: 200,
         message: "Stock de luna actualizado con éxito.",
         data: {
-          items: [lunaExistente], // Mantener estructura similar a otras respuestas
-          pagination: null, // Indica que no es una respuesta paginada
+          items: [lunaExistente],
+          pagination: null,
         },
       });
     }
@@ -205,6 +217,7 @@ const registrarLuna = async (req, res) => {
       tipo,
       stock: cantidadNumerica,
       ot,
+      zona, // Incluimos la zona al crear la nueva luna
       registradoPor,
     });
 
@@ -236,8 +249,8 @@ const registrarLuna = async (req, res) => {
       statusCode: 201,
       message: "Luna registrada con éxito.",
       data: {
-        items: [nuevaLuna], // Mantener estructura similar a otras respuestas
-        pagination: null, // Indica que no es una respuesta paginada
+        items: [nuevaLuna],
+        pagination: null,
       },
     });
   } catch (error) {
@@ -246,6 +259,7 @@ const registrarLuna = async (req, res) => {
   }
 };
 
+// Obtener todas las lunas con paginación profesional
 // Obtener todas las lunas con paginación profesional
 const obtenerLunas = async (req, res) => {
   try {
@@ -257,6 +271,8 @@ const obtenerLunas = async (req, res) => {
       stockMaximo,
       fechaDesde,
       fechaHasta,
+      ot,
+      zona, // Nuevo filtro por zona
       page = 1,
       limit = 10,
       sort = "createdAt:-1",
@@ -271,6 +287,8 @@ const obtenerLunas = async (req, res) => {
     if (tipo) filtros.tipo = tipo;
     if (esferico) filtros.esferico = parseFloat(esferico);
     if (cilindrico) filtros.cilindrico = parseFloat(cilindrico);
+    if (ot) filtros.ot = { $regex: ot, $options: "i" }; // Búsqueda insensible a mayúsculas/minúsculas
+    if (zona) filtros.zona = zona; // Nuevo filtro por zona
 
     // Filtros de stock
     if (stockMinimo || stockMaximo) {
@@ -291,6 +309,7 @@ const obtenerLunas = async (req, res) => {
       filtros.$or = [
         { tipo: { $regex: q, $options: "i" } },
         { ot: { $regex: q, $options: "i" } },
+        { zona: { $regex: q, $options: "i" } }, // Incluir zona en la búsqueda general
         // Puedes agregar más campos según sea necesario
       ];
     }
@@ -377,6 +396,8 @@ const obtenerLunas = async (req, res) => {
           ...(stockMaximo && { stockMaximo }),
           ...(fechaDesde && { fechaDesde }),
           ...(fechaHasta && { fechaHasta }),
+          ...(ot && { ot }),
+          ...(zona && { zona }), // Incluir zona en los filtros aplicados
           ...(q && { searchQuery: q }),
         },
         sort: sortOptions,
@@ -588,7 +609,7 @@ const exportarLunasAExcel = async (req, res) => {
   console.log("Iniciando exportación a Excel mejorada...");
 
   try {
-    const { fechaDesde, fechaHasta, tipoLuna, ot, serie } = req.query;
+    const { fechaDesde, fechaHasta, tipoLuna, ot, zona } = req.query;
 
     // ========== FUNCIONES AUXILIARES ==========
     const parseDate = (dateString) =>
@@ -726,11 +747,11 @@ const exportarLunasAExcel = async (req, res) => {
     }
     if (tipoLuna) filtros.tipo = tipoLuna;
     if (ot) filtros.ot = { $regex: ot, $options: "i" };
-    if (serie) filtros.serie = serie;
+    if (zona) filtros.zona = zona;
 
     const lunas = await Luna.find(filtros)
       .populate("registradoPor", "nombre apellido")
-      .sort({ tipo: 1, serie: 1, esferico: 1, cilindrico: 1 });
+      .sort({ tipo: 1, zona: 1, esferico: 1, cilindrico: 1 });
 
     if (!lunas.length) {
       return errorResponse(
@@ -810,7 +831,7 @@ const exportarLunasAExcel = async (req, res) => {
         fechaHasta && `Hasta: ${formatDate(fechaHasta)}`,
         tipoLuna && `Tipo: ${tipoLuna}`,
         ot && `OT: ${ot}`,
-        serie && `Serie: ${serie}`,
+        zona && `Zona: ${zona}`,
       ]
         .filter(Boolean)
         .join(" | ");
@@ -822,17 +843,17 @@ const exportarLunasAExcel = async (req, res) => {
         alignment: { horizontal: "center" },
       };
 
-      // Sección de resumen por serie
+      // Sección de resumen por zona
       sheet.mergeCells("A3:K3");
-      sheet.getCell("A3").value = "RESUMEN POR SERIE";
+      sheet.getCell("A3").value = "RESUMEN POR ZONA";
       sheet.getCell("A3").style = styles.subtitle;
 
-      // Configurar columnas para resumen por serie
+      // Configurar columnas para resumen por zona
       sheet.columns = [
-        { header: "Serie", key: "serie", width: 10 },
+        { header: "Zona", key: "zona", width: 15 },
         { header: "Tipo de Luna", key: "tipo", width: 25 },
         { header: "OT", key: "ot", width: 15 },
-        { header: "Modelos Únicos", key: "modelos", width: 15 },
+        { header: "Medidas Únicas", key: "medidas", width: 15 },
         { header: "Stock Actual", key: "stock", width: 15 },
         { header: "Últ. Movimiento", key: "ultimoMovimiento", width: 20 },
         { header: "Tipo Mov.", key: "tipoUltimoMovimiento", width: 12 },
@@ -849,15 +870,15 @@ const exportarLunasAExcel = async (req, res) => {
         }
       });
 
-      // Procesar datos por serie
-      const series = [...new Set(lunas.map((l) => l.serie))].sort();
-      const resumenPorSerie = series
-        .map((serie) => {
-          const lunasSerie = lunas.filter((l) => l.serie === serie);
-          const tiposLuna = [...new Set(lunasSerie.map((l) => l.tipo))];
+      // Procesar datos por zona
+      const zonas = [...new Set(lunas.map((l) => l.zona))].sort();
+      const resumenPorZona = zonas
+        .map((zona) => {
+          const lunasZona = lunas.filter((l) => l.zona === zona);
+          const tiposLuna = [...new Set(lunasZona.map((l) => l.tipo))];
 
           return tiposLuna.map((tipo) => {
-            const lunasTipo = lunasSerie.filter((l) => l.tipo === tipo);
+            const lunasTipo = lunasZona.filter((l) => l.tipo === tipo);
             const movsTipo = movimientos.filter((m) =>
               lunasTipo.some((l) => l._id.equals(m.referencia))
             );
@@ -867,10 +888,10 @@ const exportarLunasAExcel = async (req, res) => {
             );
 
             return {
-              serie,
+              zona,
               tipo,
               ot: lunasTipo[0]?.ot || "N/A",
-              modelos: new Set(
+              medidas: new Set(
                 lunasTipo.map((l) => `${l.esferico}/${l.cilindrico}`)
               ).size,
               stock: lunasTipo.reduce((sum, l) => sum + (l.stock || 0), 0),
@@ -893,13 +914,13 @@ const exportarLunasAExcel = async (req, res) => {
         })
         .flat();
 
-      // Agregar datos por serie
-      resumenPorSerie.forEach((item, index) => {
+      // Agregar datos por zona
+      resumenPorZona.forEach((item, index) => {
         const row = sheet.addRow([
-          item.serie,
+          item.zona,
           item.tipo,
           item.ot,
-          item.modelos,
+          item.medidas,
           item.stock,
           formatDate(item.ultimoMovimiento),
           item.tipoUltimoMovimiento,
@@ -952,19 +973,19 @@ const exportarLunasAExcel = async (req, res) => {
         });
       });
 
-      // Totales por serie
+      // Totales por zona
       const totalRow = sheet.addRow([
         "TOTAL GENERAL",
         "N/A",
         "N/A",
-        resumenPorSerie.reduce((sum, item) => sum + item.modelos, 0),
-        resumenPorSerie.reduce((sum, item) => sum + item.stock, 0),
+        resumenPorZona.reduce((sum, item) => sum + item.medidas, 0),
+        resumenPorZona.reduce((sum, item) => sum + item.stock, 0),
         "N/A",
         "N/A",
         "N/A",
         "N/A",
         "N/A",
-        resumenPorSerie.reduce((sum, item) => sum + item.registros, 0),
+        resumenPorZona.reduce((sum, item) => sum + item.registros, 0),
       ]);
 
       totalRow.eachCell((cell, colNumber) => {
@@ -1004,7 +1025,7 @@ const exportarLunasAExcel = async (req, res) => {
         fechaHasta && `Hasta: ${formatDate(fechaHasta)}`,
         tipoLuna && `Tipo: ${tipoLuna}`,
         ot && `OT: ${ot}`,
-        serie && `Serie: ${serie}`,
+        zona && `Zona: ${zona}`,
       ]
         .filter(Boolean)
         .join(" | ");
@@ -1016,15 +1037,14 @@ const exportarLunasAExcel = async (req, res) => {
         alignment: { horizontal: "center" },
       };
 
-      // Configurar columnas
+      // Configurar columnas (sin el campo eje)
       sheet.columns = [
         { header: "Código", key: "codigo", width: 15 },
-        { header: "Serie", key: "serie", width: 10 },
+        { header: "Zona", key: "zona", width: 15 },
         { header: "Tipo", key: "tipo", width: 20 },
         { header: "OT", key: "ot", width: 15 },
         { header: "Esférico", key: "esferico", width: 12 },
         { header: "Cilíndrico", key: "cilindrico", width: 12 },
-        { header: "Eje", key: "eje", width: 10 },
         { header: "Stock", key: "stock", width: 12 },
         { header: "Últ. Actualización", key: "actualizacion", width: 18 },
         { header: "Registrado Por", key: "registradoPor", width: 25 },
@@ -1042,12 +1062,11 @@ const exportarLunasAExcel = async (req, res) => {
       lunas.forEach((luna, index) => {
         const row = sheet.addRow({
           codigo: luna.codigo || luna._id.toString().substring(18, 24),
-          serie: luna.serie || "N/A",
+          zona: luna.zona || "N/A",
           tipo: luna.tipo,
           ot: luna.ot || "N/A",
           esferico: luna.esferico,
           cilindrico: luna.cilindrico,
-          eje: luna.eje || "N/A",
           stock: luna.stock,
           actualizacion: formatDate(luna.updatedAt || luna.createdAt),
           registradoPor: formatUser(luna.registradoPor),
@@ -1060,15 +1079,15 @@ const exportarLunasAExcel = async (req, res) => {
           // Aplicar estilos base
           Object.assign(
             cell.style,
-            colNumber === 8
+            colNumber === 7
               ? styles.number
-              : colNumber === 9
+              : colNumber === 8
               ? styles.date
               : styles.data
           );
 
           // Resaltar estado
-          if (colNumber === 11) {
+          if (colNumber === 10) {
             cell.style.font = {
               color: { argb: luna.stock > 0 ? "FF00B050" : "FFC00000" },
               bold: true,
@@ -1076,7 +1095,7 @@ const exportarLunasAExcel = async (req, res) => {
           }
 
           // Resaltar stock bajo
-          if (colNumber === 8) {
+          if (colNumber === 7) {
             if (luna.stock <= 5) {
               Object.assign(cell.style, styles.warningText);
             }
@@ -1092,14 +1111,14 @@ const exportarLunasAExcel = async (req, res) => {
         });
       });
 
-      // Totales por serie
-      const series = [...new Set(lunas.map((l) => l.serie))].sort();
-      series.forEach((serie) => {
+      // Totales por zona
+      const zonas = [...new Set(lunas.map((l) => l.zona))].sort();
+      zonas.forEach((zona) => {
         const total = lunas
-          .filter((l) => l.serie === serie)
+          .filter((l) => l.zona === zona)
           .reduce((sum, l) => sum + (l.stock || 0), 0);
         const row = sheet.addRow({
-          serie: `TOTAL SERIE ${serie}`,
+          zona: `TOTAL ZONA ${zona}`,
           stock: total,
         });
 
@@ -1107,17 +1126,17 @@ const exportarLunasAExcel = async (req, res) => {
           ...styles.total,
           alignment: { horizontal: "right" },
         };
-        row.getCell(8).style = {
+        row.getCell(7).style = {
           ...styles.number,
           ...styles.total,
         };
-        sheet.mergeCells(`A${row.number}:G${row.number}`);
+        sheet.mergeCells(`A${row.number}:F${row.number}`);
       });
 
       // Total general
       const totalGeneral = lunas.reduce((sum, l) => sum + (l.stock || 0), 0);
       const totalRow = sheet.addRow({
-        serie: "TOTAL GENERAL DEL INVENTARIO",
+        zona: "TOTAL GENERAL DEL INVENTARIO",
         stock: totalGeneral,
       });
 
@@ -1126,12 +1145,12 @@ const exportarLunasAExcel = async (req, res) => {
         font: { ...styles.total.font, size: 12 },
         alignment: { horizontal: "right" },
       };
-      totalRow.getCell(8).style = {
+      totalRow.getCell(7).style = {
         ...styles.number,
         ...styles.total,
         font: { ...styles.total.font, size: 12 },
       };
-      sheet.mergeCells(`A${totalRow.number}:G${totalRow.number}`);
+      sheet.mergeCells(`A${totalRow.number}:F${totalRow.number}`);
     };
 
     // ========== HOJA MOVIMIENTOS ==========
@@ -1148,7 +1167,7 @@ const exportarLunasAExcel = async (req, res) => {
         fechaHasta && `Hasta: ${formatDate(fechaHasta)}`,
         tipoLuna && `Tipo: ${tipoLuna}`,
         ot && `OT: ${ot}`,
-        serie && `Serie: ${serie}`,
+        zona && `Zona: ${zona}`,
       ]
         .filter(Boolean)
         .join(" | ");
@@ -1160,13 +1179,13 @@ const exportarLunasAExcel = async (req, res) => {
         alignment: { horizontal: "center" },
       };
 
-      // Configurar columnas
+      // Configurar columnas (con zona y sin eje)
       sheet.columns = [
         { header: "Correlativo", key: "correlativo", width: 15 },
         { header: "Fecha Movimiento", key: "fecha", width: 18 },
         { header: "Tipo", key: "tipo", width: 12 },
         { header: "Subtipo", key: "subtipo", width: 15 },
-        { header: "Serie", key: "serie", width: 10 },
+        { header: "Zona", key: "zona", width: 15 },
         { header: "OT", key: "ot", width: 15 },
         { header: "Tipo Luna", key: "tipoLuna", width: 20 },
         { header: "Esférico", key: "esferico", width: 12 },
@@ -1193,7 +1212,7 @@ const exportarLunasAExcel = async (req, res) => {
           fecha: formatDate(mov.fechaMovimiento || mov.createdAt),
           tipo: mov.tipoMovimiento === "ingreso" ? "Ingreso" : "Salida",
           subtipo: mov.subtipo || "N/A",
-          serie: luna?.serie || "N/A",
+          zona: luna?.zona || "N/A",
           ot: mov.documentoRelacionado?.referencia || luna?.ot || "N/A",
           tipoLuna: luna?.tipo || "N/A",
           esferico: luna?.esferico || "N/A",
@@ -1244,38 +1263,38 @@ const exportarLunasAExcel = async (req, res) => {
         });
       });
 
-      // Totales por serie
-      const series = [
+      // Totales por zona
+      const zonas = [
         ...new Set(
           movimientos
             .map((m) => {
               const luna = lunas.find((l) => l._id.equals(m.referencia));
-              return luna?.serie;
+              return luna?.zona;
             })
             .filter(Boolean)
         ),
       ].sort();
 
-      series.forEach((serie) => {
-        const movsSerie = movimientos.filter((m) => {
+      zonas.forEach((zona) => {
+        const movsZona = movimientos.filter((m) => {
           const luna = lunas.find((l) => l._id.equals(m.referencia));
-          return luna?.serie === serie;
+          return luna?.zona === zona;
         });
 
-        const totalIngresos = movsSerie
+        const totalIngresos = movsZona
           .filter((m) => m.tipoMovimiento === "ingreso")
           .reduce((sum, m) => sum + (m.cantidad || 0), 0);
 
-        const totalSalidas = movsSerie
+        const totalSalidas = movsZona
           .filter((m) => m.tipoMovimiento === "salida")
           .reduce((sum, m) => sum + (m.cantidad || 0), 0);
 
         const totalRow = sheet.addRow({
-          serie: `TOTAL SERIE ${serie}`,
+          zona: `TOTAL ZONA ${zona}`,
           cantidad: totalIngresos - totalSalidas,
         });
 
-        totalRow.getCell(1).value = `TOTAL SERIE ${serie}`;
+        totalRow.getCell(1).value = `TOTAL ZONA ${zona}`;
         totalRow.getCell(1).style = {
           ...styles.total,
           alignment: { horizontal: "right" },
@@ -1297,7 +1316,7 @@ const exportarLunasAExcel = async (req, res) => {
         .reduce((sum, m) => sum + (m.cantidad || 0), 0);
 
       const totalRow = sheet.addRow({
-        serie: "TOTAL NETO",
+        zona: "TOTAL NETO",
         cantidad: totalIngresos - totalSalidas,
       });
 
@@ -1318,7 +1337,9 @@ const exportarLunasAExcel = async (req, res) => {
     // ========== CREAR HOJAS ==========
     crearHojaResumen();
     crearHojaInventario();
-    crearHojaMovimientos();
+    if (movimientos.length > 0) {
+      crearHojaMovimientos();
+    }
 
     // ========== ENVIAR ARCHIVO ==========
     const fileName = `Reporte_Lunas_${
@@ -1344,6 +1365,7 @@ const exportarLunasAExcel = async (req, res) => {
     }
   }
 };
+
 module.exports = {
   registrarLuna,
   obtenerTiposDeLunas,

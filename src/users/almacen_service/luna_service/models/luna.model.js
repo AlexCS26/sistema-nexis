@@ -66,6 +66,14 @@ const lunaSchema = new mongoose.Schema(
       },
       required: [true, "El tipo de luna es obligatorio"],
     },
+    zona: {
+      type: String,
+      enum: {
+        values: ["Chancay", "Huaral"],
+        message: "Zona no válida. Debe ser 'Chancay' o 'Huaral'",
+      },
+      required: [true, "La zona es obligatoria (Chancay o Huaral)"],
+    },
     serie: {
       type: Number,
       enum: [1, 2, 3],
@@ -179,6 +187,34 @@ lunaSchema.statics.obtenerStockPorTipo = async function () {
       },
     },
     { $sort: { tipo: 1 } },
+  ]);
+};
+
+lunaSchema.statics.obtenerStockPorZona = async function () {
+  return this.aggregate([
+    {
+      $group: {
+        _id: "$zona",
+        stockTotal: { $sum: "$stock" },
+        cantidadModelos: { $sum: 1 },
+        disponibles: {
+          $sum: {
+            $cond: [{ $gt: ["$stock", 0] }, 1, 0],
+          },
+        },
+      },
+    },
+    {
+      $project: {
+        _id: 0,
+        zona: "$_id",
+        stockTotal: 1,
+        cantidadModelos: 1,
+        disponibles: 1,
+        agotados: { $subtract: ["$cantidadModelos", "$disponibles"] },
+      },
+    },
+    { $sort: { zona: 1 } },
   ]);
 };
 
