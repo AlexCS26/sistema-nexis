@@ -1,0 +1,91 @@
+# Análisis del Inventario de Lunas Ópticas
+
+## 1. Estructura de Datos
+
+La estructura actual del inventario presenta los siguientes componentes:
+
+| Componente | Descripción | Problema |
+|------------|-------------|----------|
+| Encabezado | Contiene información de almacén y tipo de lentes | Falta estandarización |
+| Series | 3 series de lentes (1ra, 2da, 3ra) | Dificulta el análisis integrado |
+| Parámetros | ESF/CIL en filas, valores numéricos en columnas | Formato inconsistente |
+| Valores | Cantidades de lentes por combinación | Datos dispersos |
+
+## 2. Problemas Detectados
+
+### Problemas Estructurales
+- **Organización fragmentada**: Datos divididos en 3 series sin relación clara
+- **Falta de metadatos**: No hay información sobre:
+  - Fecha del inventario
+  - Responsable
+  - Unidades de medida
+  - Tipo de lente (Blue/Verde)
+
+### Problemas de Datos
+| Problema | Ejemplo | Impacto |
+|----------|---------|---------|
+| Valores faltantes | "0" en lugar de vacío | Puede confundirse con stock cero |
+| Inconsistencia numérica | Valores sin decimales vs. con decimales | Dificulta cálculos |
+| Repetición de valores | "0.25" aparece como fila y como dato | Confusión en interpretación |
+| Formato no uniforme | Mezcla de números y texto libre | Dificulta procesamiento automático |
+
+### Problemas de Usabilidad
+- No hay totales por categoría
+- Dificultad para comparar series
+- No permite análisis transversal
+
+## 3. Recomendaciones
+
+### Estructura Ideal (Formato Tabular)
+
+```markdown
+| Almacén | Tipo Lente | Serie | ESF | CIL | Cantidad | Fecha Inventario |
+|---------|------------|-------|-----|-----|----------|------------------|
+| HUARAL  | Blue       | 1     | 0.25| 0.25| 1        | 2023-11-15       |
+| HUARAL  | Verde      | 2     | 1.50| 3.00| 2        | 2023-11-15       |
+```
+
+### Acciones Recomendadas
+
+1. **Normalización de datos**:
+   - Unificar las 3 series en una sola tabla
+   - Agregar metadatos esenciales
+
+2. **Mejoras de formato**:
+   - Usar valores nulos para stock faltante (no ceros)
+   - Establecer precisión decimal consistente
+
+3. **Validación de datos**:
+   - Verificar rangos válidos para ESF/CIL
+   - Eliminar entradas duplicadas
+
+4. **Análisis adicional**:
+   - Calcular indicadores de rotación
+   - Identificar combinaciones con bajo stock
+
+### Ejemplo de Transformación
+
+Estado Actual (fragmento):
+```
+	0.25	0.5	0.75
+0.25	1	5	3
+0.5	2	2	2
+```
+
+Estado Recomendado:
+```markdown
+| ESF | CIL  | Cantidad |
+|-----|------|----------|
+| 0.25| 0.25 | 1        |
+| 0.25| 0.50 | 5        |
+| 0.25| 0.75 | 3        |
+| 0.50| 0.25 | 2        |
+| 0.50| 0.50 | 2        |
+| 0.50| 0.75 | 2        |
+```
+
+Esta estructura permitiría:
+- Análisis estadístico adecuado
+- Integración con sistemas de gestión
+- Generación automática de reportes
+- Identificación de patrones de inventario

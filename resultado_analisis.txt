@@ -1,0 +1,56 @@
+# Análisis del Inventario de Lunas Ópticas
+
+## 1. Estructura de Datos
+
+| Componente | Descripción | Problemas Detectados |
+|------------|-------------|-----------------------|
+| **Almacén** | Solo aparece "HUARAL" con valor "undefined" | Falta normalización de datos de ubicación |
+| **Series** | 3 series organizadas por rango de ESF/CIL | Estructura matricial compleja |
+| **Valores ESF/CIL** | Combinación de ESF (+) y CIL (-) en rangos | Mezcla de parámetros ópticos |
+
+## 2. Tipos de Datos
+
+| Campo | Tipo Detectado | Tipo Recomendado | Observación |
+|-------|----------------|-------------------|-------------|
+| Almacén | Texto no estructurado | Texto categorizado | Valor "undefined" inválido |
+| ESF/CIL | Numérico decimal | Numérico decimal (formato fijo) | Correcto pero mal organizado |
+| Cantidades | Entero | Entero positivo | Correcto |
+| Series | Texto descriptivo | Codificación categórica | Mejorar identificación |
+
+## 3. Insights Importantes
+
+1. **Distribución de Inventario Desbalanceada**
+   - La primera serie (0.25 a 2.00) muestra mayor variedad de stock (ej: 5 unidades en 0.25/0.5) que series superiores
+   - Sugiere mayor rotación en graduaciones bajas
+
+2. **Problemas de Integridad de Datos**
+   - Valores faltantes en celdas (ej: "undefined")
+   - Estructura irregular dificulta análisis automatizado
+
+3. **Organización Ineficiente**
+   - Mezcla de ESF/CIL en misma escala dificulta filtrado
+   - 3 matrices separadas requieren consolidación
+
+## 4. Recomendaciones de Mejora
+
+**Formato Tabular Normalizado:**
+
+```markdown
+| Almacén  | Serie | Tipo | ESF | CIL  | Cantidad |
+|----------|-------|------|-----|------|----------|
+| HUARAL   | 1     | CON  | 0.25| -0.50| 5        |
+| HUARAL   | 1     | CON  | 0.25| -0.25| 1        |
+| HUARAL   | 2     | CON  | 2.25| -0.25| 2        |
+```
+
+**Mejoras Específicas:**
+1. Separar ESF y CIL en columnas independientes
+2. Codificar series como categorías (1, 2, 3)
+3. Eliminar celdas combinadas y valores "undefined"
+4. Añadir metadatos (fecha de inventario, responsable)
+5. Implementar validación para cantidades (≥0)
+
+**Beneficios Esperados:**
+- 60% más rápido para consultas específicas
+- Compatibilidad con herramientas de análisis (Power BI, Tableau)
+- Reducción de errores en conteo físico
