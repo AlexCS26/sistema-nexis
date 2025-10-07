@@ -15,9 +15,6 @@ const VentaService = require("../services/ventaService");
 const { updateProductStock } = require("../../../utils/updateProductStock");
 const { generarComprobantePDF } = require("../../../utils/pdfGenerator");
 
-// Helpers
-const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
-
 class VentaController {
   /**
    * @desc    Crear una nueva venta con OT automática
@@ -389,7 +386,7 @@ class VentaController {
       // Buscar la venta con relaciones necesarias
       const venta = await Venta.findById(id)
         .select(
-          "ot paciente items vendedora recojos totalVenta pagos saldoPendiente fechaVenta"
+          "ot paciente items vendedora recojos totalVenta pagos saldoPendiente fechaVenta serie numero"
         )
         .populate("paciente")
         .populate("items.productId")
@@ -408,8 +405,11 @@ class VentaController {
         ? `Venta_${ot}.pdf`
         : `Venta_${venta._id.toString().slice(-6)}.pdf`;
 
-      // 🔹 Generar PDF en memoria
-      const pdfBuffer = await generarComprobantePDF(venta, "NOTA DE VENTA");
+      // 🔹 Generar PDF usando Nubefact
+      const pdfBuffer = await generarComprobantePDF(
+        venta,
+        "BOLETA DE VENTA ELECTRÓNICA"
+      );
 
       // 🔹 Configurar headers ANTES de enviar
       res.setHeader("Content-Type", "application/pdf");
