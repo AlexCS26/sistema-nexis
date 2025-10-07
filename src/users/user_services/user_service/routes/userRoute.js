@@ -4,18 +4,32 @@ const {
   getAllUsers,
   getAllVendedores,
 } = require("../controllers/userController");
-const { verificarToken } = require("../../../middlewares/protect");
-const { verifyAdminRole } = require("../../../middlewares/verifyAdminRole");
+const {
+  verificarToken,
+  verificarRol,
+} = require("../../../middlewares/protect");
 
 const router = express.Router();
 
-// 📌 Obtener el usuario autenticado
-router.get("/me", verificarToken, getAuthenticatedUser);
+router.get(
+  "/me",
+  verificarToken,
+  verificarRol(["admin", "vendedor", "inventario"]),
+  getAuthenticatedUser
+);
 
-// 📌 Obtener todos los usuarios (solo admin)
-router.get("/all", verificarToken, verifyAdminRole, getAllUsers);
+router.get(
+  "/all",
+  verificarToken,
+  verificarRol(["admin", "vendedor", "inventario"]),
+  getAllUsers
+);
 
-// 📌 Obtener solo los vendedores (solo admin)
-router.get("/vendedores", verificarToken, verifyAdminRole, getAllVendedores);
+router.get(
+  "/vendedores",
+  verificarToken,
+  verificarRol(["admin", "vendedor", "inventario"]),
+  getAllVendedores
+);
 
 module.exports = router;

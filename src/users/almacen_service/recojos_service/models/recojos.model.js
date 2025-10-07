@@ -1,64 +1,66 @@
 const mongoose = require("mongoose");
 const mongoosePaginate = require("mongoose-paginate-v2");
 
+/**
+ * Schema principal RecojoOptica (genérico para cualquier producto)
+ */
 const recojosOpticaSchema = new mongoose.Schema({
-  // Tipo de documento (NUEVO CAMPO)
   tipo: {
     type: String,
     required: true,
     enum: ["RECOJO", "SEPARACION"],
     default: "RECOJO",
   },
-
-  // Columnas principales
   numero: { type: Number, unique: true },
   fechaCompra: { type: Date, required: true },
   ordenTrabajo: { type: String, required: true },
   nombreApellido: { type: String, required: true },
-  monturaLunas: { type: String, required: true },
-  total: { type: Number, required: true },
-  cuenta: { type: Number }, // Columna "A" en el Excel
-  saldo: { type: Number },
 
-  // Estructura para múltiples adelantos (pagos parciales)
-  adelantos: [
+  // 🔹 Items del recojo (cualquier producto, variante o medida)
+  items: [
     {
-      fecha: Date,
-      ordenTrabajo: String, // "OT" en el Excel
-      importe: Number,
-      saldo: Number, // Saldo después de este pago
+      productId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Product",
+        required: true,
+      },
+      variantId: { type: mongoose.Schema.Types.ObjectId, ref: "Variant" },
+      measureId: { type: mongoose.Schema.Types.ObjectId, ref: "Measure" },
+      quantity: { type: Number, default: 1 },
+      unitPrice: { type: Number, required: true },
+      totalPrice: { type: Number, required: true },
     },
   ],
 
-  // Cancelado (pago completo)
-  cancelado: {
-    fecha: Date,
-    importe: Number,
-  },
+  total: { type: Number, required: true },
+  cuenta: { type: Number },
+  saldo: { type: Number },
+  adelantos: [
+    { fecha: Date, ordenTrabajo: String, importe: Number, saldo: Number },
+  ],
+  cancelado: { fecha: Date, importe: Number },
 
-  // Ubicación actual
   estaEn: {
     type: String,
-    enum: ["TIENDA", "LABORATORIO", "ENTREGADO"],
-    default: "TIENDA",
+    enum: ["EN_TIENDA", "EN_LABORATORIO", "ENTREGADO"],
+    default: "EN_TIENDA",
+  },
+  venta: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Venta",
   },
 
-  // Entrega
   entregado: {
-    ordenTrabajo: String, // "OT" en entrega
+    ordenTrabajo: String,
     fecha: Date,
-    recibidoPor: String, // "MIRIAM" en el Excel
-    encargada: String, // "YANNINA" en el Excel
+    recibidoPor: String,
+    encargada: String,
   },
-
-  // Tienda específica (NUEVO CAMPO)
   tienda: {
-    type: String,
-    enum: ["MIRIAM_BOLIVAR", "ZARA_HUARAL", "OTRA_TIENDA"],
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Tienda",
     required: true,
   },
-
-  // Metadata
   fechaCreacion: { type: Date, default: Date.now },
   fechaActualizacion: { type: Date, default: Date.now },
 });
@@ -66,31 +68,20 @@ const recojosOpticaSchema = new mongoose.Schema({
 // Plugin de paginación
 recojosOpticaSchema.plugin(mongoosePaginate);
 
-// Middleware para número secuencial
-recojosOpticaSchema.pre("save", async function (next) {
-  if (!this.isNew || this.numero) {
-    this.fechaActualizacion = new Date();
-    return next();
-  }
-
-  try {
-    const lastDoc = await RecojoOptica.findOne().sort({ numero: -1 }).limit(1);
-    this.numero = lastDoc ? lastDoc.numero + 1 : 1;
-    next();
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Método para verificar pago completo
+// Métodos auxiliares
 recojosOpticaSchema.methods.pagoCompleto = function () {
   return this.saldo <= 0;
 };
 
-// Método para obtener el tipo como texto descriptivo
 recojosOpticaSchema.methods.getTipoDescripcion = function () {
   return this.tipo === "RECOJO" ? "Recojo" : "Separación";
 };
+
+// Middleware para mantener fecha de actualización
+recojosOpticaSchema.pre("save", function (next) {
+  this.fechaActualizacion = new Date();
+  next();
+});
 
 const RecojoOptica = mongoose.model("RecojoOptica", recojosOpticaSchema);
 

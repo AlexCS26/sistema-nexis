@@ -1,4 +1,5 @@
 const RecojoOptica = require("../models/recojos.model");
+const Venta = require("../../../venta_service/venta_service/models/venta.model");
 const {
   successResponse,
   errorResponse,
@@ -26,12 +27,32 @@ const crearRecojo = async (req, res) => {
       return errorResponse(res, 400, "Tienda no válida");
     }
 
+    // Validar que haya items
+    if (
+      !req.body.items ||
+      !Array.isArray(req.body.items) ||
+      req.body.items.length === 0
+    ) {
+      return errorResponse(res, 400, "Debe agregar al menos un item");
+    }
+
+    // Calcular total si no viene
+    if (!req.body.total) {
+      req.body.total = req.body.items.reduce(
+        (sum, item) => sum + (item.totalPrice || 0),
+        0
+      );
+    }
+
+    // Calcular saldo inicial
+    req.body.saldo = req.body.total - (req.body.cuenta || 0);
+
     const nuevoRecojo = new RecojoOptica({
       ...req.body,
       // Establecer valores por defecto si no vienen en el request
       tipo: req.body.tipo || "RECOJO",
       tienda: req.body.tienda || "OTRA_TIENDA",
-      estaEn: req.body.estaEn || "TIENDA",
+      estaEn: req.body.estaEn || "EN_TIENDA",
     });
 
     const recojosGuardado = await nuevoRecojo.save();
@@ -71,8 +92,8 @@ const obtenerRecojos = async (req, res) => {
       nombreApellido,
       ordenTrabajo,
       estaEn,
-      tipo, // Nuevo parámetro para filtrar por tipo (RECOJO/SEPARACION)
-      tienda, // Nuevo parámetro para filtrar por tienda
+      tipo,
+      tienda,
     } = req.query;
 
     // Validar parámetros de paginación
@@ -181,24 +202,38 @@ const obtenerRecojos = async (req, res) => {
 
     // Filtro por ubicación actual
     if (estaEn) {
-      const ubicacionesValidas = ["TIENDA", "LABORATORIO", "ENTREGADO"];
+      const ubicacionesValidas = ["EN_TIENDA", "EN_LABORATORIO", "ENTREGADO"];
       if (!ubicacionesValidas.includes(estaEn.toUpperCase())) {
         return errorResponse(
           res,
           400,
-          "El parámetro 'estaEn' debe ser uno de: TIENDA, LABORATORIO, ENTREGADO"
+          "El parámetro 'estaEn' debe ser uno de: EN_TIENDA, EN_LABORATORIO, ENTREGADO"
         );
       }
       query.estaEn = estaEn.toUpperCase();
     }
 
-    // Opciones de paginación
+    // Opciones de paginación con populate para items
     const options = {
       page: pagina,
       limit: limite,
-      sort: { fechaCompra: -1 }, // Ordenar por fecha de compra descendente
+      sort: { fechaCompra: -1 },
       collation: { locale: "es" },
-      select: "-__v", // Excluir el campo __v
+      select: "-__v",
+      populate: [
+        {
+          path: "items.productId",
+          select: "code name brand descripcion",
+        },
+        {
+          path: "items.variantId",
+          select: "code color size material",
+        },
+        {
+          path: "items.measureId",
+          select: "code sphere cylinder add serie",
+        },
+      ],
     };
 
     // Ejecutar consulta
@@ -236,7 +271,19 @@ const obtenerRecojos = async (req, res) => {
  */
 const obtenerRecojo = async (req, res) => {
   try {
-    const documento = await RecojoOptica.findById(req.params.id);
+    const documento = await RecojoOptica.findById(req.params.id)
+      .populate({
+        path: "items.productId",
+        select: "code name brand descripcion",
+      })
+      .populate({
+        path: "items.variantId",
+        select: "code color size material",
+      })
+      .populate({
+        path: "items.measureId",
+        select: "code sphere cylinder add serie",
+      });
 
     if (!documento) {
       return errorResponse(res, 404, "Documento no encontrado");
@@ -279,11 +326,37 @@ const actualizarRecojo = async (req, res) => {
       return errorResponse(res, 400, "Tienda no válida");
     }
 
+    // Si se actualizan items, recalcular total y saldo
+    if (req.body.items && Array.isArray(req.body.items)) {
+      const nuevoTotal = req.body.items.reduce(
+        (sum, item) => sum + (item.totalPrice || 0),
+        0
+      );
+      req.body.total = nuevoTotal;
+
+      // Mantener la cuenta actual si no se proporciona una nueva
+      const documentoActual = await RecojoOptica.findById(req.params.id);
+      const cuentaActual = documentoActual ? documentoActual.cuenta : 0;
+      req.body.saldo = nuevoTotal - (req.body.cuenta || cuentaActual);
+    }
+
     const documentoActualizado = await RecojoOptica.findByIdAndUpdate(
       req.params.id,
       req.body,
       { new: true, runValidators: true }
-    );
+    )
+      .populate({
+        path: "items.productId",
+        select: "code name brand descripcion",
+      })
+      .populate({
+        path: "items.variantId",
+        select: "code color size material",
+      })
+      .populate({
+        path: "items.measureId",
+        select: "code sphere cylinder add serie",
+      });
 
     if (!documentoActualizado) {
       return errorResponse(res, 404, "Documento no encontrado");
@@ -392,15 +465,28 @@ const marcarEntregado = async (req, res) => {
 };
 
 /**
- * @desc    Registrar un pago/adelanto
+ * @desc    Registrar un pago/adelanto y sincronizar con la venta
  * @route   PATCH /api/recojos/:id/pagar
  * @access  Private
  */
 const registrarPago = async (req, res) => {
   try {
-    const { importe, fecha = new Date(), ordenTrabajo } = req.body;
+    const {
+      importe,
+      fecha = new Date(),
+      ordenTrabajo,
+      metodo = "EFECTIVO",
+    } = req.body;
+
+    console.log("[Pago] Iniciando registro de pago:", {
+      importe,
+      fecha,
+      ordenTrabajo,
+      metodo,
+    });
 
     if (!importe || isNaN(importe)) {
+      console.warn("[Pago] Importe inválido:", importe);
       return errorResponse(
         res,
         400,
@@ -408,54 +494,113 @@ const registrarPago = async (req, res) => {
       );
     }
 
+    // Buscar recojo
     const documento = await RecojoOptica.findById(req.params.id);
-
     if (!documento) {
+      console.warn("[Pago] Documento no encontrado:", req.params.id);
       return errorResponse(res, 404, "Documento no encontrado");
     }
+    console.log(
+      "[Pago] Documento encontrado:",
+      documento._id,
+      "Saldo actual:",
+      documento.saldo
+    );
 
-    // Crear nuevo adelanto
+    // --- SINCRONIZAR CON VENTA PRIMERO ---
+    let totalPagado = documento.cuenta || 0;
+    if (documento.venta) {
+      console.log("[Pago] Sincronizando con venta:", documento.venta);
+      const venta = await Venta.findById(documento.venta);
+      if (venta) {
+        // Agregar pago a la venta
+        venta.pagos.push({
+          monto: parseFloat(importe),
+          metodo,
+          fecha: new Date(fecha),
+        });
+
+        // Calcular total pagado y actualizar saldo/porcentaje
+        totalPagado = venta.pagos.reduce((acc, p) => acc + (p.monto || 0), 0);
+        venta.saldoPendiente = Math.max(
+          0,
+          (venta.totalVenta || 0) - totalPagado
+        );
+        venta.porcentajePagado = (
+          (totalPagado / (venta.totalVenta || 1)) *
+          100
+        ).toFixed(2);
+
+        if (venta.saldoPendiente <= 0 && !venta.fechaCancelacion) {
+          venta.fechaCancelacion = new Date();
+          console.log("[Pago] Venta cancelada automáticamente:", venta._id);
+        }
+
+        await venta.save();
+        console.log("[Pago] Venta sincronizada correctamente:", venta._id);
+      } else {
+        console.warn("[Pago] Venta asociada no encontrada:", documento.venta);
+      }
+    } else {
+      totalPagado += parseFloat(importe);
+    }
+
+    // --- ACTUALIZAR RECOJO ---
+    // Crear nuevo adelanto con saldo actualizado según venta
     const nuevoAdelanto = {
       fecha: new Date(fecha),
       ordenTrabajo: ordenTrabajo || documento.ordenTrabajo,
       importe: parseFloat(importe),
-      saldo: (documento.saldo || documento.total) - parseFloat(importe),
+      saldo: documento.total - totalPagado,
     };
 
-    // Agregar al array de adelantos
-    if (!documento.adelantos) {
-      documento.adelantos = [];
-    }
+    documento.adelantos = documento.adelantos || [];
     documento.adelantos.push(nuevoAdelanto);
 
-    // Actualizar saldo
-    documento.saldo = Math.max(
-      0,
-      (documento.saldo || documento.total) - parseFloat(importe)
+    // Actualizar saldo y cuenta
+    documento.saldo = Math.max(0, documento.total - totalPagado);
+    documento.cuenta = totalPagado;
+
+    // 🔹 Determinar tipo (RECOJO o SEPARACION) basado en porcentaje pagado
+    const porcentajePagado = (totalPagado / (documento.total || 1)) * 100;
+
+    if (porcentajePagado >= 50) {
+      documento.tipo = "RECOJO";
+    } else {
+      documento.tipo = "SEPARACION";
+    }
+
+    console.log(
+      `[Pago] Tipo actualizado automáticamente a: ${
+        documento.tipo
+      } (Pagado: ${porcentajePagado.toFixed(2)}%)`
     );
 
-    // Si el saldo llega a cero, marcar como cancelado
+    // Marcar cancelado si el saldo llega a cero
     if (documento.saldo <= 0) {
-      documento.cancelado = {
-        fecha: new Date(),
-        importe: documento.total,
-      };
+      documento.cancelado = { fecha: new Date(), importe: documento.total };
+      console.log("[Pago] Documento cancelado automáticamente:", documento._id);
     }
 
     const documentoActualizado = await documento.save();
+    console.log(
+      "[Pago] Documento recojo actualizado:",
+      documentoActualizado._id,
+      "Saldo:",
+      documentoActualizado.saldo
+    );
 
     successResponse(
       res,
       200,
-      "Pago registrado exitosamente",
+      "Pago registrado y sincronizado exitosamente",
       documentoActualizado
     );
   } catch (error) {
-    if (error.name === "CastError") {
+    console.error("[Pago] Error al registrar el pago:", error);
+    if (error.name === "CastError")
       errorResponse(res, 400, "ID inválido", error);
-    } else {
-      errorResponse(res, 500, "Error al registrar el pago", error);
-    }
+    else errorResponse(res, 500, "Error al registrar el pago", error);
   }
 };
 

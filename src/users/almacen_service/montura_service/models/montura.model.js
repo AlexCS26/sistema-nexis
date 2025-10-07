@@ -28,10 +28,11 @@ const monturaSchema = new mongoose.Schema(
       trim: true,
       default: "GENÉRICO",
     },
-    precioBase: {
+    precioUnitario: {
+      // <-- Modificado
       type: Number,
-      required: [true, "El precio base es obligatorio"],
-      min: [0, "El precio base no puede ser negativo"],
+      required: [true, "El precio unitario es obligatorio"],
+      min: [0, "El precio unitario no puede ser negativo"],
     },
     stock: {
       type: Number,

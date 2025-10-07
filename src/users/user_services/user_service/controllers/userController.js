@@ -4,7 +4,10 @@ const {
   errorResponse,
 } = require("../../../utils/responseUtils");
 
-// 📌 Obtener todos los usuarios (solo para admin)
+/**
+ * 📌 Obtener todos los usuarios
+ * ⚠️ La seguridad y roles se manejan en la ruta
+ */
 const getAllUsers = async (req, res) => {
   try {
     const users = await User.find({}, "-credenciales.passwordHash"); // Excluye el password
@@ -19,14 +22,15 @@ const getAllUsers = async (req, res) => {
   }
 };
 
-// 📌 Obtener solo los vendedores
+/**
+ * 📌 Obtener solo los usuarios con rol 'vendedor'
+ */
 const getAllVendedores = async (req, res) => {
   try {
     const vendedores = await User.find(
       { rol: "vendedor" },
       "-credenciales.passwordHash"
     );
-
     return successResponse(
       res,
       200,
@@ -38,7 +42,9 @@ const getAllVendedores = async (req, res) => {
   }
 };
 
-// 📌 Obtener datos del usuario autenticado
+/**
+ * 📌 Obtener los datos del usuario autenticado
+ */
 const getAuthenticatedUser = async (req, res) => {
   try {
     const user = await User.findById(
@@ -61,4 +67,8 @@ const getAuthenticatedUser = async (req, res) => {
   }
 };
 
-module.exports = { getAuthenticatedUser, getAllUsers, getAllVendedores };
+module.exports = {
+  getAuthenticatedUser,
+  getAllUsers,
+  getAllVendedores,
+};

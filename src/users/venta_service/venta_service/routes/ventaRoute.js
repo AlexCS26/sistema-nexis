@@ -6,99 +6,37 @@ const {
   verificarRol,
   validarObjectId,
 } = require("../../../middlewares/protect");
-const { check, validationResult } = require("express-validator");
-const { errorResponse } = require("../../../utils/responseUtils");
 
-// Validaciones personalizadas
-const validarCreacionVenta = [
-  check("ot", "La orden de trabajo es obligatoria y única").notEmpty(),
-  check(
-    "paciente.nombres",
-    "Los nombres del paciente son obligatorios"
-  ).notEmpty(),
-  check(
-    "paciente.apellidos",
-    "Los apellidos del paciente son obligatorios"
-  ).notEmpty(),
-  check("montura", "La montura es obligatoria").isMongoId(),
-  check("luna", "La luna es obligatoria").isMongoId(),
-  check("vendedora", "La vendedora es obligatoria").notEmpty(),
-  check("totalVenta", "El total debe ser un número positivo").isFloat({
-    gt: 0,
-  }),
-  check("tienda", "La tienda es obligatoria").isIn([
-    "MIRIAM_BOLIVAR",
-    "ZARA_HUARAL",
-    "OTRA_TIENDA",
-  ]),
-  (req, res, next) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return errorResponse(res, 400, "Error de validación", null, {
-        errors: errors.array(),
-      });
-    }
-    next();
-  },
-];
-
-const validarPago = [
-  check("monto", "El monto es requerido y debe ser positivo").isFloat({
-    gt: 0,
-  }),
-  check("tipo", "El tipo de pago es obligatorio").isIn([
-    "INGRESO",
-    "A_CUENTA",
-    "SEPARACION",
-  ]),
-  (req, res, next) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return errorResponse(res, 400, "Error de validación", null, {
-        errors: errors.array(),
-      });
-    }
-    next();
-  },
-];
-
-const validarEstadoEntrega = [
-  check("estadoEntrega", "Estado no válido").isIn([
-    "EN_TIENDA",
-    "EN_LABORATORIO",
-    "ENTREGADO",
-  ]),
-  check("recibidoPor", "Persona que recibe es requerida para entregas")
-    .if((req) => req.body.estadoEntrega === "ENTREGADO")
-    .notEmpty(),
-  (req, res, next) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return errorResponse(res, 400, "Error de validación", null, {
-        errors: errors.array(),
-      });
-    }
-    next();
-  },
-];
-
-// Aplicar verificación de token a todas las rutas
+// 🔐 Todas las rutas protegidas con token
 router.use(verificarToken);
 
-// Rutas CRUD básicas para ventas
+/**
+ * @desc    Crear una nueva venta
+ * @route   POST /api/ventas
+ * @access  Private (admin, vendedor)
+ */
 router.post(
   "/",
   verificarRol(["admin", "vendedor"]),
-  validarCreacionVenta,
   VentaController.crearVenta
 );
 
+/**
+ * @desc    Obtener todas las ventas
+ * @route   GET /api/ventas
+ * @access  Private (admin, vendedor, optometrista, tecnico)
+ */
 router.get(
   "/",
   verificarRol(["admin", "vendedor", "optometrista", "tecnico"]),
   VentaController.obtenerVentas
 );
 
+/**
+ * @desc    Obtener una venta por ID
+ * @route   GET /api/ventas/:id
+ * @access  Private (admin, vendedor, optometrista, tecnico)
+ */
 router.get(
   "/:id",
   validarObjectId,
@@ -106,6 +44,11 @@ router.get(
   VentaController.obtenerVenta
 );
 
+/**
+ * @desc    Actualizar una venta por ID
+ * @route   PUT /api/ventas/:id
+ * @access  Private (admin, vendedor)
+ */
 router.put(
   "/:id",
   validarObjectId,
@@ -113,34 +56,117 @@ router.put(
   VentaController.actualizarVenta
 );
 
-// Rutas para operaciones específicas
+/**
+ * @desc    Eliminar una venta por ID
+ * @route   DELETE /api/ventas/:id
+ * @access  Private (admin)
+ */
+router.delete(
+  "/:id",
+  validarObjectId,
+  verificarRol(["admin"]),
+  VentaController.eliminarVenta
+);
+
+/**
+ * @desc    Registrar un pago a una venta
+ * @route   POST /api/ventas/:id/pagos
+ * @access  Private (admin, cajero, vendedor)
+ */
 router.post(
   "/:id/pagos",
   validarObjectId,
   verificarRol(["admin", "cajero", "vendedor"]),
-  validarPago,
   VentaController.registrarPago
 );
 
+/**
+ * @desc    Actualizar el estado de entrega de una venta
+ * @route   PUT /api/ventas/:id/estado-entrega
+ * @access  Private (admin, vendedor, tecnico)
+ */
 router.put(
   "/:id/estado-entrega",
   validarObjectId,
   verificarRol(["admin", "vendedor", "tecnico"]),
-  validarEstadoEntrega,
   VentaController.actualizarEstadoEntrega
 );
 
-// Rutas para reportes comerciales
+/**
+ * @desc    Obtener movimientos de una venta
+ * @route   GET /api/ventas/:id/movements
+ * @access  Private (admin, vendedor, inventario)
+ */
+router.get(
+  "/:id/movements",
+  validarObjectId,
+  verificarRol(["admin", "vendedor", "inventario"]),
+  VentaController.obtenerMovimientosVenta
+);
+
+/**
+ * @desc    Reporte: Productos vendidos
+ * @route   GET /api/ventas/reportes/productos-vendidos
+ * @access  Private (admin, vendedor, inventario)
+ */
 router.get(
   "/reportes/productos-vendidos",
   verificarRol(["admin", "vendedor", "inventario"]),
   VentaController.obtenerProductosVendidos
 );
 
+/**
+ * @desc    Reporte: Estado de ventas (logística)
+ * @route   GET /api/ventas/reportes/estado-ventas
+ * @access  Private (admin, vendedor, tecnico)
+ */
 router.get(
   "/reportes/estado-ventas",
   verificarRol(["admin", "vendedor", "tecnico"]),
   VentaController.obtenerEstadoVentas
+);
+
+/**
+ * @desc    Reporte: Ventas por vendedora
+ * @route   GET /api/ventas/reportes/vendedoras
+ * @access  Private (admin, vendedor)
+ */
+router.get(
+  "/reportes/vendedoras",
+  verificarRol(["admin", "vendedor"]),
+  VentaController.obtenerVentasPorVendedora
+);
+
+/**
+ * @desc    Estadísticas generales de ventas
+ * @route   GET /api/ventas/estadisticas/generales
+ * @access  Private (admin, vendedor)
+ */
+router.get(
+  "/estadisticas/generales",
+  verificarRol(["admin", "vendedor"]),
+  VentaController.obtenerEstadisticasGenerales
+);
+/**
+ * @desc    Generar reporte de ventas en Excel profesional
+ * @route   GET /api/ventas/reportes/excel
+ * @access  Private (admin, gerente, vendedor)
+ */
+router.get(
+  "/reportes/excel",
+  verificarRol(["admin", "gerente", "vendedor"]),
+  VentaController.generarReporteExcel
+);
+/**
+ * @desc    Generar PDF de la venta
+ * @route   GET /api/ventas/:id/pdf
+ * @access  Private (admin, vendedor, optometrista, tecnico)
+ */
+router.get(
+  "/:id/pdf",
+  validarObjectId,
+  verificarRol(["admin", "vendedor", "optometrista", "tecnico"]),
+  VentaController.generarPDF
 );
 
 module.exports = router;

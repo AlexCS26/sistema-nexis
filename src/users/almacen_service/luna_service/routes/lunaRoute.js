@@ -3,13 +3,13 @@ const router = express.Router();
 const {
   registrarLuna,
   obtenerLunas,
-  obtenerTiposDeLunas,
   obtenerMedidasPorIdLuna,
   obtenerLunaPorId,
   actualizarStock,
   eliminarLuna,
-  obtenerStockPorTipo,
-  exportarLunasAExcel, // Agregar el nuevo controlador
+  exportarLunasAExcel,
+  obtenerInsightsIA,
+  obtenerReporteStock,
 } = require("../controllers/lunaController");
 
 const {
@@ -18,7 +18,11 @@ const {
   validarObjectId,
 } = require("../../../middlewares/protect");
 
-// 📌 Registrar una nueva luna (Solo "almacen" o "admin")
+/**
+ * @desc    Registrar una nueva luna
+ * @route   POST /api/lunas
+ * @access  Private (almacen, admin)
+ */
 router.post(
   "/",
   verificarToken,
@@ -26,24 +30,54 @@ router.post(
   registrarLuna
 );
 
-// 📌 Obtener todas las lunas (Cualquier usuario autenticado)
+/**
+ * @desc    Obtener todas las lunas
+ * @route   GET /api/lunas
+ * @access  Private
+ */
 router.get("/", verificarToken, obtenerLunas);
 
-// 📌 Exportar lunas a Excel (Cualquier usuario autenticado con roles permitidos)
+/**
+ * @desc    Exportar lunas a Excel
+ * @route   GET /api/lunas/exportar/excel
+ * @access  Private (admin, almacen)
+ */
 router.get(
   "/exportar/excel",
   verificarToken,
-  verificarRol(["admin", "almacen", "supervisor"]), // Solo estos roles pueden exportar
+  verificarRol(["admin", "almacen"]),
   exportarLunasAExcel
 );
 
-// 📌 Obtener tipos de lunas (Cualquier usuario autenticado)
-router.get("/tipos", verificarToken, obtenerTiposDeLunas);
+/**
+ * @desc    Obtener insights de IA sobre stock
+ * @route   POST /api/lunas/insights
+ * @access  Private (admin, almacen)
+ */
+router.post(
+  "/insights",
+  verificarToken,
+  verificarRol(["admin", "almacen"]),
+  obtenerInsightsIA
+);
 
-// 📌 Obtener stock total por tipo de luna (Cualquier usuario autenticado)
-router.get("/stock-por-tipo", verificarToken, obtenerStockPorTipo);
+/**
+ * @desc    Reporte unificado de stock
+ * @route   GET /api/lunas/reporte-stock
+ * @access  Private (admin, almacen)
+ */
+router.get(
+  "/reporte-stock",
+  verificarToken,
+  verificarRol(["admin", "almacen"]),
+  obtenerReporteStock
+);
 
-// 📌 Obtener medidas disponibles por ID de luna (Cualquier usuario autenticado)
+/**
+ * @desc    Obtener medidas disponibles por ID de luna
+ * @route   GET /api/lunas/medidas/:id
+ * @access  Private
+ */
 router.get(
   "/medidas/:id",
   verificarToken,
@@ -51,10 +85,18 @@ router.get(
   obtenerMedidasPorIdLuna
 );
 
-// 📌 Obtener una luna por ID (Cualquier usuario autenticado)
+/**
+ * @desc    Obtener una luna por ID
+ * @route   GET /api/lunas/:id
+ * @access  Private
+ */
 router.get("/:id", verificarToken, validarObjectId, obtenerLunaPorId);
 
-// 📌 Actualizar stock de una luna (Solo "almacen" o "admin")
+/**
+ * @desc    Actualizar stock de una luna
+ * @route   PATCH /api/lunas/:id/stock
+ * @access  Private (almacen, admin)
+ */
 router.patch(
   "/:id/stock",
   verificarToken,
@@ -63,7 +105,11 @@ router.patch(
   actualizarStock
 );
 
-// 📌 Eliminar una luna (Solo "admin")
+/**
+ * @desc    Eliminar una luna
+ * @route   DELETE /api/lunas/:id
+ * @access  Private (admin)
+ */
 router.delete(
   "/:id",
   verificarToken,

@@ -3,6 +3,13 @@ const ExcelJS = require("exceljs");
 const Luna = require("../models/luna.model");
 const Movimiento = require("../models/movimiento.model");
 const {
+  analizarStockIA,
+} = require("../../../ia_service/services/deepseekService");
+const {
+  validarRangoYIncremento,
+  determinarSerie,
+} = require("../../../utils/lunaUtils");
+const {
   successResponse,
   errorResponse,
 } = require("../../../utils/responseUtils");
@@ -15,21 +22,6 @@ const ROLES_PERMITIDOS = [
   "almacen",
   "supervisor",
 ];
-
-// Obtener tipos de lunas disponibles
-const obtenerTiposDeLunas = async (req, res) => {
-  try {
-    const tiposUnicos = await Luna.distinct("tipo");
-    return successResponse(
-      res,
-      200,
-      "Tipos de lunas obtenidos con éxito.",
-      tiposUnicos
-    );
-  } catch (error) {
-    return errorResponse(res, 500, "Error al obtener tipos de lunas.", error);
-  }
-};
 
 const obtenerMedidasPorIdLuna = async (req, res) => {
   try {
@@ -87,6 +79,187 @@ const obtenerMedidasPorIdLuna = async (req, res) => {
   }
 };
 
+const obtenerInsightsIA = async (req, res) => {
+  const startTime = Date.now();
+
+  try {
+    let { items, filtros } = req.body;
+
+    // ================= 1️⃣ Obtener items si no vienen en body =================
+    if ((!items || !Array.isArray(items) || items.length === 0) && filtros) {
+      items = await Luna.find(filtros).lean();
+    }
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return errorResponse(res, 400, "No hay datos suficientes para analizar.");
+    }
+
+    // ================= 2️⃣ Validación avanzada =================
+    items = items.filter(
+      (it) => it.tipo && it.zona && typeof it.stock === "number"
+    );
+
+    if (items.length === 0) {
+      return errorResponse(
+        res,
+        400,
+        "Los items no cumplen con la estructura mínima requerida."
+      );
+    }
+
+    // ================= 3️⃣ Preprocesar items por tipo + medida + zona =================
+    const processedItems = [];
+    const itemsByClave = {};
+
+    items.forEach((item) => {
+      let medidas = [];
+
+      // 3a. Si ya tiene medidas explícitas
+      if (Array.isArray(item.medidas) && item.medidas.length > 0) {
+        medidas = item.medidas.map((m) => ({
+          valor: m.valor || m,
+          stock: m.stock || item.stock,
+        }));
+      }
+      // 3b. Si tiene ESF y/o CIL
+      else if (item.esferico || item.cilindrico) {
+        const esfValues = Array.isArray(item.esferico)
+          ? item.esferico.map(Number)
+          : [item.esferico ? parseFloat(item.esferico) : 0.0];
+
+        const cilValues = Array.isArray(item.cilindrico)
+          ? item.cilindrico.map(Number)
+          : [item.cilindrico ? parseFloat(item.cilindrico) : 0.0];
+
+        esfValues.forEach((esf) => {
+          cilValues.forEach((cil) => {
+            medidas.push({
+              valor: `ESF:${esf} CIL:${cil}`,
+              stock: item.stock,
+            });
+          });
+        });
+      }
+      // 3c. Caso sin medidas
+      else {
+        medidas = [{ valor: "GENERICA", stock: item.stock }];
+      }
+
+      // ================= 3d. Acumular por clave única (tipo+medida+zona) =================
+      medidas.forEach((m) => {
+        const clave = `${item.tipo}|${m.valor}|${item.zona}`;
+        if (!itemsByClave[clave]) {
+          itemsByClave[clave] = {
+            tipo: item.tipo,
+            medida: m.valor,
+            stock: 0,
+            zona: item.zona,
+          };
+        }
+        itemsByClave[clave].stock += m.stock;
+      });
+    });
+
+    // ================= 3e. Convertir a array plano =================
+    const processedItemsArray = Object.values(itemsByClave);
+
+    // ================= 4️⃣ Llamada a la IA =================
+    const insightsRaw = await analizarStockIA(processedItemsArray);
+
+    // ================= 5️⃣ Parseo seguro =================
+    let summary = "El análisis fue exitoso.";
+    let zonasCriticas = [];
+    let tiposCriticos = [];
+    let recomendaciones = [];
+
+    try {
+      let parsed;
+      if (typeof insightsRaw === "string") {
+        const cleaned = insightsRaw
+          .replace(/```json|```/g, "")
+          .replace(/\\n/g, "")
+          .replace(/\\"/g, '"')
+          .trim();
+
+        try {
+          parsed = JSON.parse(cleaned);
+        } catch (e) {
+          console.warn("No se pudo parsear insightsRaw, fallback a string:", e);
+          parsed = {};
+        }
+      } else {
+        parsed = insightsRaw;
+      }
+
+      summary = parsed.summary || summary;
+      zonasCriticas = parsed.zonasCriticas || [];
+      tiposCriticos = parsed.tiposCriticos || [];
+      recomendaciones = parsed.recomendaciones || [];
+
+      // Extraer JSON de recomendación si la IA devuelve todo dentro de ella
+      if (
+        recomendaciones.length === 1 &&
+        typeof recomendaciones[0] === "string" &&
+        recomendaciones[0].includes("{")
+      ) {
+        try {
+          const jsonStr = recomendaciones[0].replace(/```json|```/g, "").trim();
+          const parsedFromRecom = JSON.parse(jsonStr);
+          zonasCriticas = parsedFromRecom.zonasCriticas || zonasCriticas;
+          tiposCriticos = parsedFromRecom.tiposCriticos || tiposCriticos;
+          recomendaciones = parsedFromRecom.recomendaciones || recomendaciones;
+        } catch (e) {
+          console.warn("No se pudo extraer JSON de la recomendación:", e);
+        }
+      }
+    } catch (e) {
+      console.warn("⚠️ Error parseando insights, usando fallback.", e);
+    }
+
+    // ================= 6️⃣ Enriquecimiento automático =================
+    const recomendacionesLimpias = recomendaciones.map((r) => {
+      const match = r.match(/stock:\s*(\d+)/);
+      if (!match) return r;
+      const stock = parseInt(match[1]);
+      if (stock <= 2) return `🔥 CRÍTICO: ${r}`;
+      if (stock <= 5) return `⚠️ Bajo: ${r}`;
+      return r;
+    });
+
+    // ================= 7️⃣ Metadata extendida =================
+    const endTime = Date.now();
+    const metadata = {
+      totalItems: processedItemsArray.length,
+      totalZonas: zonasCriticas.length,
+      totalTipos: tiposCriticos.length,
+      totalRecomendaciones: recomendacionesLimpias.length,
+      generadoEn: new Date().toISOString(),
+      duracionMs: endTime - startTime,
+      modeloIA: "DeepSeek v1.5",
+      insightId: crypto.randomUUID(),
+    };
+
+    // ================= 8️⃣ Respuesta final =================
+    const respuesta = {
+      summary,
+      zonasCriticas,
+      tiposCriticos,
+      recomendaciones: recomendacionesLimpias,
+      metadata,
+    };
+
+    return res.status(200).json({
+      success: true,
+      message: "Insights de inventario generados exitosamente",
+      data: respuesta,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("❌ Error en obtenerInsightsIA:", error.message, error);
+    return errorResponse(res, 500, "Error al generar insights con IA.", error);
+  }
+};
+
 // Función auxiliar para formatear dioptrías
 function formatDioptria(value) {
   if (!value) return "0.00";
@@ -95,36 +268,15 @@ function formatDioptria(value) {
   return num >= 0 ? `+${num.toFixed(2)}` : num.toFixed(2);
 }
 
+// Registrar una nueva luna o actualizar stock si ya existe
 const registrarLuna = async (req, res) => {
   try {
-    console.log("🔹 Iniciando registro de luna...");
+    const { esferico, cilindrico, tipo, stock, precioUnitario, ot, zona } =
+      req.body;
+    const registradoPor = req.usuario?.userId || "sistema";
 
-    const ROLES_PERMITIDOS_REGISTRO = ["almacen", "admin"];
-    if (!req.usuario || !ROLES_PERMITIDOS_REGISTRO.includes(req.usuario.rol)) {
-      console.warn("❌ Usuario sin permisos para registrar lunas.");
-      return errorResponse(
-        res,
-        403,
-        "No tienes permisos para registrar lunas."
-      );
-    }
-
-    const { esferico, cilindrico, tipo, stock, ot, zona } = req.body;
-    const registradoPor = req.usuario.userId;
-
-    console.log("📌 Datos recibidos:", {
-      esferico,
-      cilindrico,
-      tipo,
-      ot,
-      stock,
-      zona,
-      registradoPor,
-    });
-
-    // Validaciones
+    // 🔹 Validaciones obligatorias
     if (!esferico && !cilindrico) {
-      console.warn("❌ Falta esférico o cilíndrico.");
       return errorResponse(
         res,
         400,
@@ -133,7 +285,6 @@ const registrarLuna = async (req, res) => {
     }
 
     if (!zona) {
-      console.warn("❌ Falta especificar la zona (Chancay o Huaral).");
       return errorResponse(
         res,
         400,
@@ -142,7 +293,6 @@ const registrarLuna = async (req, res) => {
     }
 
     if (!ot) {
-      console.warn("❌ Falta número de OT.");
       return errorResponse(
         res,
         400,
@@ -150,39 +300,63 @@ const registrarLuna = async (req, res) => {
       );
     }
 
-    // Convertir y validar stock
+    if (
+      precioUnitario === undefined ||
+      precioUnitario === null ||
+      isNaN(Number(precioUnitario))
+    ) {
+      return errorResponse(
+        res,
+        400,
+        "El precio unitario es obligatorio y debe ser un número válido."
+      );
+    }
+    if (Number(precioUnitario) < 0) {
+      return errorResponse(
+        res,
+        400,
+        "El precio unitario no puede ser negativo."
+      );
+    }
+
+    // 🔹 Validar esférico y cilíndrico usando utils
+    if (!validarRangoYIncremento(esferico, false)) {
+      return errorResponse(
+        res,
+        400,
+        "Valor esférico inválido (debe estar entre -6.00 y +6.00 en incrementos de 0.25)."
+      );
+    }
+    if (!validarRangoYIncremento(cilindrico, true)) {
+      return errorResponse(
+        res,
+        400,
+        "Valor cilíndrico inválido (debe estar entre -6.00 y 0.00 en incrementos de 0.25)."
+      );
+    }
+
+    // 🔹 Validar y convertir stock
     const cantidadNumerica = Number(stock);
-    if (isNaN(cantidadNumerica)) {
-      return errorResponse(res, 400, "La cantidad debe ser un número válido");
+    if (!Number.isFinite(cantidadNumerica)) {
+      return errorResponse(res, 400, "La cantidad debe ser un número válido.");
     }
     if (cantidadNumerica < 0) {
-      return errorResponse(res, 400, "La cantidad no puede ser negativa");
+      return errorResponse(res, 400, "La cantidad no puede ser negativa.");
     }
 
-    // Verificar si la luna ya existe
-    console.log("🔍 Buscando luna existente...");
-    const lunaExistente = await Luna.findOne({
-      esferico,
-      cilindrico,
-      tipo,
-      ot,
-      zona, // Ahora también consideramos la zona en la búsqueda
-    });
+    // 🔹 Verificar si ya existe la luna
+    let luna = await Luna.findOne({ esferico, cilindrico, tipo, ot, zona });
 
-    if (lunaExistente) {
-      console.log("✅ Luna ya existente. Actualizando stock...");
-      lunaExistente.stock += cantidadNumerica;
-      lunaExistente.fechaActualizacion = Date.now();
-      await lunaExistente.save();
+    if (luna) {
+      luna.stock += cantidadNumerica;
+      luna.precioUnitario = Number(precioUnitario); // actualizar precio unitario
+      luna.serie = determinarSerie(cilindrico); // calcular serie automáticamente
+      await luna.save();
 
-      console.log("✅ Stock actualizado con éxito:", lunaExistente);
-
-      // Registrar movimiento si hay stock positivo
       if (cantidadNumerica > 0) {
-        console.log("📌 Registrando movimiento...");
         await Movimiento.create({
           tipo: "luna",
-          referencia: lunaExistente._id,
+          referencia: luna._id,
           tipoMovimiento: "ingreso",
           subtipo: "compra",
           cantidad: cantidadNumerica,
@@ -193,74 +367,64 @@ const registrarLuna = async (req, res) => {
           },
           registradoPor,
           estado: "completado",
+          zona,
         });
-        console.log("✅ Movimiento registrado.");
       }
 
-      // Estructura de respuesta consistente
       return res.status(200).json({
         success: true,
         statusCode: 200,
         message: "Stock de luna actualizado con éxito.",
-        data: {
-          items: [lunaExistente],
-          pagination: null,
-        },
+        data: { items: [luna], pagination: null },
+        timestamp: new Date().toISOString(),
       });
     }
 
-    // Crear nueva luna
-    console.log("✅ Registrando nueva luna...");
+    // 🔹 Crear nueva luna
     const nuevaLuna = await Luna.create({
       esferico,
       cilindrico,
       tipo,
       stock: cantidadNumerica,
+      precioUnitario: Number(precioUnitario), // incluir precio unitario
+      serie: determinarSerie(cilindrico),
       ot,
-      zona, // Incluimos la zona al crear la nueva luna
+      zona,
       registradoPor,
     });
 
-    console.log("✅ Luna registrada con éxito:", nuevaLuna);
-
-    // Registrar movimiento si hay stock positivo
     if (cantidadNumerica > 0) {
-      console.log("📌 Registrando movimiento...");
       await Movimiento.create({
         tipo: "luna",
         referencia: nuevaLuna._id,
         tipoMovimiento: "ingreso",
         subtipo: "compra",
         cantidad: cantidadNumerica,
-        documentoRelacionado: {
-          tipo: "ot",
-          referencia: ot,
-          fecha: new Date(),
-        },
+        documentoRelacionado: { tipo: "ot", referencia: ot, fecha: new Date() },
         registradoPor,
         estado: "completado",
+        zona,
       });
-      console.log("✅ Movimiento registrado.");
     }
 
-    // Estructura de respuesta consistente
     return res.status(201).json({
       success: true,
       statusCode: 201,
       message: "Luna registrada con éxito.",
-      data: {
-        items: [nuevaLuna],
-        pagination: null,
-      },
+      data: { items: [nuevaLuna], pagination: null },
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("❌ Error al registrar luna:", error);
-    return errorResponse(res, 500, "Error al registrar luna.", error);
+    return errorResponse(
+      res,
+      500,
+      "Error al registrar luna.",
+      process.env.NODE_ENV === "development" ? error : undefined
+    );
   }
 };
 
-// Obtener todas las lunas con paginación profesional
-// Obtener todas las lunas con paginación profesional
+// Obtener todas las lunas con paginación (sin IA)
 const obtenerLunas = async (req, res) => {
   try {
     const {
@@ -272,69 +436,69 @@ const obtenerLunas = async (req, res) => {
       fechaDesde,
       fechaHasta,
       ot,
-      zona, // Nuevo filtro por zona
+      zona,
       page = 1,
       limit = 10,
-      sort = "createdAt:-1",
+      sort = "createdAt:desc",
       fields = "",
-      q = "", // Búsqueda general
+      q = "",
     } = req.query;
 
-    // Construir filtros avanzados
+    const parsedPage = Math.max(1, parseInt(page, 10) || 1);
+    const parsedLimit = Math.min(Math.max(1, parseInt(limit, 10) || 10), 100);
+
     const filtros = {};
+    if (tipo) filtros.tipo = String(tipo).trim();
+    if (!isNaN(parseFloat(esferico))) filtros.esferico = parseFloat(esferico);
+    if (!isNaN(parseFloat(cilindrico)))
+      filtros.cilindrico = parseFloat(cilindrico);
+    if (ot) filtros.ot = { $regex: String(ot).trim(), $options: "i" };
+    if (zona) filtros.zona = String(zona).trim();
 
-    // Filtros específicos
-    if (tipo) filtros.tipo = tipo;
-    if (esferico) filtros.esferico = parseFloat(esferico);
-    if (cilindrico) filtros.cilindrico = parseFloat(cilindrico);
-    if (ot) filtros.ot = { $regex: ot, $options: "i" }; // Búsqueda insensible a mayúsculas/minúsculas
-    if (zona) filtros.zona = zona; // Nuevo filtro por zona
-
-    // Filtros de stock
     if (stockMinimo || stockMaximo) {
       filtros.stock = {};
-      if (stockMinimo) filtros.stock.$gte = parseInt(stockMinimo);
-      if (stockMaximo) filtros.stock.$lte = parseInt(stockMaximo);
+      if (!isNaN(parseInt(stockMinimo)))
+        filtros.stock.$gte = parseInt(stockMinimo, 10);
+      if (!isNaN(parseInt(stockMaximo)))
+        filtros.stock.$lte = parseInt(stockMaximo, 10);
     }
 
-    // Filtros de fecha
     if (fechaDesde || fechaHasta) {
       filtros.createdAt = {};
-      if (fechaDesde) filtros.createdAt.$gte = new Date(fechaDesde);
-      if (fechaHasta) filtros.createdAt.$lte = new Date(fechaHasta);
+      if (fechaDesde && !isNaN(Date.parse(fechaDesde)))
+        filtros.createdAt.$gte = new Date(fechaDesde);
+      if (fechaHasta && !isNaN(Date.parse(fechaHasta)))
+        filtros.createdAt.$lte = new Date(fechaHasta);
     }
 
-    // Búsqueda general (si se proporciona)
-    if (q) {
+    if (q && String(q).trim()) {
       filtros.$or = [
         { tipo: { $regex: q, $options: "i" } },
         { ot: { $regex: q, $options: "i" } },
-        { zona: { $regex: q, $options: "i" } }, // Incluir zona en la búsqueda general
-        // Puedes agregar más campos según sea necesario
+        { zona: { $regex: q, $options: "i" } },
       ];
     }
 
-    // Parsear el parámetro de ordenamiento (ahora soporta múltiples campos)
+    // Sort
     const sortOptions = {};
     if (sort) {
-      sort.split(",").forEach((sortItem) => {
-        const [field, direction] = sortItem.split(":");
-        sortOptions[field] = direction === "desc" ? -1 : 1;
-      });
-    } else {
-      sortOptions.createdAt = -1; // Orden por defecto
+      try {
+        sort.split(",").forEach((s) => {
+          const [field, dir = "asc"] = s.split(":");
+          if (field) sortOptions[field] = dir === "desc" ? -1 : 1;
+        });
+      } catch {
+        sortOptions.createdAt = -1;
+      }
     }
 
-    // Configuración de paginación profesional
-    const opciones = {
-      page: parseInt(page, 10),
-      limit: Math.min(parseInt(limit, 10), 100), // Límite máximo de 100
+    // Paginación
+    const resultado = await Luna.paginate(filtros, {
+      page: parsedPage,
+      limit: parsedLimit,
       sort: sortOptions,
       select: fields ? fields.replace(/,/g, " ") : "",
-      populate: {
-        path: "registradoPor",
-        select: "nombre apellido email",
-      },
+      populate: { path: "registradoPor", select: "nombre apellido email" },
       lean: true,
       leanWithId: false,
       customLabels: {
@@ -349,31 +513,9 @@ const obtenerLunas = async (req, res) => {
         hasPrevPage: "hasPrevious",
         hasNextPage: "hasNext",
       },
-    };
+    });
 
-    // Ejecutar consulta paginada
-    const resultado = await Luna.paginate(filtros, opciones);
-
-    // Construir enlaces HATEOAS para navegación
-    const baseUrl = `${req.protocol}://${req.get("host")}${req.baseUrl}${
-      req.path
-    }`;
-    const queryParams = new URLSearchParams({ ...req.query, page: "" });
-
-    const links = {
-      first: `${baseUrl}?${queryParams.toString()}1`,
-      last: `${baseUrl}?${queryParams.toString()}${resultado.totalPages}`,
-      prev: resultado.hasPrevious
-        ? `${baseUrl}?${queryParams.toString()}${resultado.prevPage}`
-        : null,
-      next: resultado.hasNext
-        ? `${baseUrl}?${queryParams.toString()}${resultado.nextPage}`
-        : null,
-      self: `${baseUrl}?${queryParams.toString()}${resultado.currentPage}`,
-    };
-
-    // Estructura de respuesta profesional
-    const response = {
+    return res.status(200).json({
       success: true,
       message: "Lista de lunas obtenida exitosamente",
       data: {
@@ -387,28 +529,13 @@ const obtenerLunas = async (req, res) => {
           hasPrevious: resultado.hasPrevious,
           hasNext: resultado.hasNext,
         },
-        links,
-        filters: {
-          ...(tipo && { tipo }),
-          ...(esferico && { esferico }),
-          ...(cilindrico && { cilindrico }),
-          ...(stockMinimo && { stockMinimo }),
-          ...(stockMaximo && { stockMaximo }),
-          ...(fechaDesde && { fechaDesde }),
-          ...(fechaHasta && { fechaHasta }),
-          ...(ot && { ot }),
-          ...(zona && { zona }), // Incluir zona en los filtros aplicados
-          ...(q && { searchQuery: q }),
-        },
         sort: sortOptions,
         fields: fields ? fields.split(",") : "all",
       },
       timestamp: new Date().toISOString(),
-    };
-
-    return res.status(200).json(response);
+    });
   } catch (error) {
-    return errorResponse(res, 500, "Error al obtener lunas.", error);
+    return errorResponse(res, 500, "Error interno al obtener lunas.", error);
   }
 };
 
@@ -429,103 +556,81 @@ const obtenerLunaPorId = async (req, res) => {
 
 const actualizarStock = async (req, res) => {
   try {
-    console.log("🔹 Iniciando actualización de stock...");
-
-    const ROLES_PERMITIDOS_STOCK = ["almacen", "admin"];
-    if (!req.usuario || !ROLES_PERMITIDOS_STOCK.includes(req.usuario.rol)) {
-      console.warn("❌ Usuario sin permisos para actualizar stock.");
-      return errorResponse(
-        res,
-        403,
-        "No tienes permisos para actualizar stock."
-      );
-    }
-
+    // ✅ Extraer parámetros y body con defaults seguros
     const { id: lunaId } = req.params;
     const {
-      cantidad,
+      cantidad = 0,
       tipoMovimiento,
-      motivo,
+      motivo = "",
       ubicacionOrigen,
       ubicacionDestino,
+      zona,
     } = req.body;
 
-    console.log("📌 Datos recibidos:", {
-      lunaId,
-      cantidad,
-      tipoMovimiento,
-      motivo,
-      ubicacionOrigen,
-      ubicacionDestino,
-    });
+    if (!lunaId) {
+      return errorResponse(res, 400, "Debe proporcionar un ID de luna válido.");
+    }
 
-    // Validar tipo de movimiento
+    // ✅ Validar tipoMovimiento
     if (!["ingreso", "salida"].includes(tipoMovimiento)) {
-      console.warn("❌ Tipo de movimiento inválido:", tipoMovimiento);
       return errorResponse(res, 400, "Tipo de movimiento inválido.");
     }
 
-    // Convertir y validar cantidad
+    // ✅ Validar cantidad
     const cantidadNumerica = Number(cantidad);
-    if (isNaN(cantidadNumerica)) {
-      console.warn("❌ Cantidad no es un número válido:", cantidad);
-      return errorResponse(res, 400, "La cantidad debe ser un número válido");
-    }
-    if (cantidadNumerica <= 0) {
-      console.warn("❌ Cantidad debe ser mayor a cero:", cantidadNumerica);
-      return errorResponse(res, 400, "La cantidad debe ser mayor a cero");
+    if (!Number.isFinite(cantidadNumerica) || cantidadNumerica <= 0) {
+      return errorResponse(
+        res,
+        400,
+        "La cantidad debe ser un número mayor a 0."
+      );
     }
 
-    // Obtener y validar luna
-    console.log("🔍 Buscando luna con ID:", lunaId);
+    // ✅ Obtener luna y validar existencia
     const luna = await Luna.findById(lunaId);
     if (!luna) {
-      console.warn("❌ Luna no encontrada con ID:", lunaId);
       return errorResponse(res, 404, "Luna no encontrada.");
     }
 
-    // Calcular nuevo stock
-    let nuevoStock =
+    // ✅ Validar zona
+    if (!luna.zona && !zona) {
+      return errorResponse(res, 400, "Debe asignar una zona a la luna.");
+    }
+    if (zona) {
+      luna.zona = zona;
+    }
+
+    // ✅ Calcular stock nuevo
+    const nuevoStock =
       tipoMovimiento === "ingreso"
         ? luna.stock + cantidadNumerica
         : luna.stock - cantidadNumerica;
 
     if (nuevoStock < 0) {
-      console.warn(
-        "❌ Stock insuficiente. Stock actual:",
-        luna.stock,
-        "Cantidad a retirar:",
-        cantidadNumerica
-      );
       return errorResponse(res, 400, "Stock insuficiente.");
     }
 
-    // Actualizar luna
+    // ✅ Guardar cambios en luna
     luna.stock = nuevoStock;
     luna.fechaActualizacion = Date.now();
     await luna.save();
-    console.log("✅ Stock actualizado. Nuevo stock:", luna.stock);
 
-    // Determinar subtipo basado en motivo
-    let subtipo;
+    // ✅ Determinar subtipo del movimiento
+    let subtipo = null;
     if (tipoMovimiento === "ingreso") {
       subtipo = motivo === "devolucion" ? "devolucion" : "compra";
     } else {
-      subtipo =
-        motivo === "venta"
-          ? "venta"
-          : motivo === "consumo"
-          ? "consumo"
-          : motivo === "perdida"
-          ? "perdida"
-          : motivo === "rotura"
-          ? "rotura"
-          : motivo === "traslado"
-          ? "traslado"
-          : null;
+      const subtiposValidos = [
+        "venta",
+        "consumo",
+        "perdida",
+        "rotura",
+        "traslado",
+      ];
+      subtipo = subtiposValidos.includes(motivo) ? motivo : "salida";
     }
 
-    // Registrar movimiento completo
+    // ✅ Registrar movimiento
     const movimientoData = {
       tipo: "luna",
       referencia: luna._id,
@@ -537,19 +642,17 @@ const actualizarStock = async (req, res) => {
         referencia: luna.ot || "N/A",
         fecha: new Date(),
       },
-      registradoPor: req.usuario.userId,
+      registradoPor: req.usuario?.userId || "sistema",
       estado: "completado",
-      notas: motivo || `Actualización de stock ${tipoMovimiento}`,
+      notas: motivo || `Actualización de stock (${tipoMovimiento})`,
+      zona: luna.zona,
+      ...(ubicacionOrigen && { ubicacionOrigen }),
+      ...(ubicacionDestino && { ubicacionDestino }),
     };
 
-    // Añadir ubicaciones si existen
-    if (ubicacionOrigen) movimientoData.ubicacionOrigen = ubicacionOrigen;
-    if (ubicacionDestino) movimientoData.ubicacionDestino = ubicacionDestino;
-
     const movimientoCreado = await Movimiento.create(movimientoData);
-    console.log("📌 Movimiento registrado:", movimientoCreado._id);
 
-    // Estructura de respuesta consistente
+    // ✅ Respuesta consistente
     return res.status(200).json({
       success: true,
       statusCode: 200,
@@ -557,15 +660,20 @@ const actualizarStock = async (req, res) => {
       data: {
         items: [
           {
-            luna: luna,
+            luna: {
+              id: luna._id,
+              tipo: luna.tipo,
+              stock: luna.stock,
+              zona: luna.zona,
+            },
             movimiento: movimientoCreado,
           },
         ],
         pagination: null,
       },
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("❌ Error en actualizarStock:", error);
     return errorResponse(
       res,
       500,
@@ -574,18 +682,154 @@ const actualizarStock = async (req, res) => {
     );
   }
 };
-// Obtener stock total por tipo de luna
-const obtenerStockPorTipo = async (req, res) => {
+
+// 📌 Reporte unificado de stock (zona | tipo_zona | tipo | tipos)
+const obtenerReporteStock = async (req, res) => {
   try {
-    const stockPorTipo = await Luna.obtenerStockPorTipo();
+    const { filtro } = req.query; // zona | tipo_zona | tipo | tipos
+    let reporte;
+
+    if (filtro === "zona") {
+      // --- Reporte por zona con sus tipos
+      const zonas = await Luna.aggregate([
+        {
+          $group: {
+            _id: { zona: "$zona", tipo: "$tipo" },
+            stockTotal: { $sum: "$stock" },
+            cantidadModelos: { $sum: 1 },
+            disponibles: { $sum: { $cond: [{ $gt: ["$stock", 0] }, 1, 0] } },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            zona: "$_id.zona",
+            tipo: "$_id.tipo",
+            stockTotal: 1,
+            cantidadModelos: 1,
+            disponibles: 1,
+            agotados: { $subtract: ["$cantidadModelos", "$disponibles"] },
+          },
+        },
+        {
+          $group: {
+            _id: "$zona",
+            stockTotal: { $sum: "$stockTotal" },
+            cantidadModelos: { $sum: "$cantidadModelos" },
+            disponibles: { $sum: "$disponibles" },
+            agotados: { $sum: "$agotados" },
+            tipos: {
+              $push: {
+                tipo: "$tipo",
+                stockTotal: "$stockTotal",
+                cantidadModelos: "$cantidadModelos",
+                disponibles: "$disponibles",
+                agotados: "$agotados",
+              },
+            },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            zona: "$_id",
+            stockTotal: 1,
+            cantidadModelos: 1,
+            disponibles: 1,
+            agotados: 1,
+            tipos: 1,
+          },
+        },
+        { $sort: { zona: 1 } },
+      ]);
+
+      // --- Reporte global por tipo (sumando todas las zonas)
+      const tiposGlobales = await Luna.aggregate([
+        {
+          $group: {
+            _id: "$tipo",
+            stockTotal: { $sum: "$stock" },
+            cantidadModelos: { $sum: 1 },
+            disponibles: { $sum: { $cond: [{ $gt: ["$stock", 0] }, 1, 0] } },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            tipo: "$_id",
+            stockTotal: 1,
+            cantidadModelos: 1,
+            disponibles: 1,
+            agotados: { $subtract: ["$cantidadModelos", "$disponibles"] },
+          },
+        },
+        { $sort: { tipo: 1 } },
+      ]);
+
+      reporte = { zonas, tiposGlobales };
+    } else if (filtro === "tipo_zona") {
+      reporte = await Luna.aggregate([
+        {
+          $group: {
+            _id: { tipo: "$tipo", zona: "$zona" },
+            stockTotal: { $sum: "$stock" },
+            cantidadModelos: { $sum: 1 },
+            disponibles: { $sum: { $cond: [{ $gt: ["$stock", 0] }, 1, 0] } },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            tipo: "$_id.tipo",
+            zona: "$_id.zona",
+            stockTotal: 1,
+            cantidadModelos: 1,
+            disponibles: 1,
+            agotados: { $subtract: ["$cantidadModelos", "$disponibles"] },
+          },
+        },
+        { $sort: { tipo: 1, zona: 1 } },
+      ]);
+    } else if (filtro === "tipo") {
+      reporte = await Luna.aggregate([
+        {
+          $group: {
+            _id: "$tipo",
+            stockTotal: { $sum: "$stock" },
+            cantidadModelos: { $sum: 1 },
+            disponibles: { $sum: { $cond: [{ $gt: ["$stock", 0] }, 1, 0] } },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            tipo: "$_id",
+            stockTotal: 1,
+            cantidadModelos: 1,
+            disponibles: 1,
+            agotados: { $subtract: ["$cantidadModelos", "$disponibles"] },
+          },
+        },
+        { $sort: { tipo: 1 } },
+      ]);
+    } else if (filtro === "tipos") {
+      reporte = await Luna.distinct("tipo");
+    } else {
+      return errorResponse(
+        res,
+        400,
+        "Filtro inválido. Usa: zona | tipo_zona | tipo | tipos"
+      );
+    }
+
     return successResponse(
       res,
       200,
-      "Stock por tipo obtenido con éxito.",
-      stockPorTipo
+      `Reporte de stock (${filtro}) obtenido con éxito.`,
+      reporte
     );
   } catch (error) {
-    return errorResponse(res, 500, "Error al obtener stock por tipo.", error);
+    return errorResponse(res, 500, "Error al obtener reporte de stock.", error);
   }
 };
 
@@ -609,7 +853,7 @@ const exportarLunasAExcel = async (req, res) => {
   console.log("Iniciando exportación a Excel mejorada...");
 
   try {
-    const { fechaDesde, fechaHasta, tipoLuna, ot, zona } = req.query;
+    const { fechaDesde, fechaHasta, tipo, ot, zona } = req.query;
 
     // ========== FUNCIONES AUXILIARES ==========
     const parseDate = (dateString) =>
@@ -634,7 +878,7 @@ const exportarLunasAExcel = async (req, res) => {
         ? `${user.nombre || ""} ${user.apellido || ""}`.trim() || "Sistema"
         : "Sistema";
 
-    // ========== ESTILOS MEJORADOS ==========
+    // ========== ESTILOS ==========
     const styles = {
       header: {
         font: { bold: true, color: { argb: "FFFFFFFF" }, size: 11 },
@@ -670,17 +914,6 @@ const exportarLunasAExcel = async (req, res) => {
           right: { style: "thin" },
         },
         numFmt: "#,##0",
-        alignment: { vertical: "middle", horizontal: "right" },
-      },
-      decimal: {
-        font: { size: 10 },
-        border: {
-          top: { style: "thin" },
-          bottom: { style: "thin" },
-          left: { style: "thin" },
-          right: { style: "thin" },
-        },
-        numFmt: "0.00",
         alignment: { vertical: "middle", horizontal: "right" },
       },
       date: {
@@ -745,7 +978,7 @@ const exportarLunasAExcel = async (req, res) => {
         filtros.createdAt.$lte = hasta;
       }
     }
-    if (tipoLuna) filtros.tipo = tipoLuna;
+    if (tipo) filtros.tipo = tipo;
     if (ot) filtros.ot = { $regex: ot, $options: "i" };
     if (zona) filtros.zona = zona;
 
@@ -778,29 +1011,6 @@ const exportarLunasAExcel = async (req, res) => {
       .populate("ubicacionOrigen ubicacionDestino", "nombre")
       .sort({ fechaMovimiento: 1 });
 
-    // Función para calcular stock post movimiento
-    const getStockPost = (mov, luna) => {
-      if (!luna) return "N/A";
-
-      const movsLuna = movimientos
-        .filter(
-          (m) =>
-            m.referencia.equals(luna._id) &&
-            new Date(m.fechaMovimiento) <= new Date(mov.fechaMovimiento)
-        )
-        .sort(
-          (a, b) => new Date(a.fechaMovimiento) - new Date(b.fechaMovimiento)
-        );
-
-      return movsLuna.reduce(
-        (stock, m) =>
-          m.tipoMovimiento === "ingreso"
-            ? stock + m.cantidad
-            : stock - m.cantidad,
-        luna.stock || 0
-      );
-    };
-
     // ========== CONFIGURAR LIBRO EXCEL ==========
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Sistema Óptico";
@@ -812,232 +1022,146 @@ const exportarLunasAExcel = async (req, res) => {
     const crearHojaResumen = () => {
       const sheet = workbook.addWorksheet("Resumen");
 
-      // Títulos
-      sheet.mergeCells("A1:K1");
+      sheet.mergeCells("A1:G1");
       sheet.getCell(
         "A1"
       ).value = `REPORTE DE INVENTARIO DE LUNAS - ${new Date().toLocaleDateString(
         "es-PE",
-        {
-          year: "numeric",
-          month: "long",
-          day: "numeric",
-        }
+        { year: "numeric", month: "long", day: "numeric" }
       )}`;
       sheet.getCell("A1").style = styles.title;
 
       const filtrosText = [
         fechaDesde && `Desde: ${formatDate(fechaDesde)}`,
         fechaHasta && `Hasta: ${formatDate(fechaHasta)}`,
-        tipoLuna && `Tipo: ${tipoLuna}`,
+        tipo && `Tipo: ${tipo}`,
         ot && `OT: ${ot}`,
         zona && `Zona: ${zona}`,
       ]
         .filter(Boolean)
         .join(" | ");
 
-      sheet.mergeCells("A2:K2");
+      sheet.mergeCells("A2:G2");
       sheet.getCell("A2").value = filtrosText || "Todos los registros";
       sheet.getCell("A2").style = {
         font: { italic: true, size: 11 },
         alignment: { horizontal: "center" },
       };
 
-      // Sección de resumen por zona
-      sheet.mergeCells("A3:K3");
+      sheet.mergeCells("A3:G3");
       sheet.getCell("A3").value = "RESUMEN POR ZONA";
       sheet.getCell("A3").style = styles.subtitle;
 
-      // Configurar columnas para resumen por zona
       sheet.columns = [
         { header: "Zona", key: "zona", width: 15 },
         { header: "Tipo de Luna", key: "tipo", width: 25 },
         { header: "OT", key: "ot", width: 15 },
-        { header: "Medidas Únicas", key: "medidas", width: 15 },
         { header: "Stock Actual", key: "stock", width: 15 },
         { header: "Últ. Movimiento", key: "ultimoMovimiento", width: 20 },
         { header: "Tipo Mov.", key: "tipoUltimoMovimiento", width: 12 },
-        { header: "Subtipo", key: "subtipo", width: 15 },
-        { header: "Últ. Ingreso", key: "ultimoIngreso", width: 20 },
-        { header: "Últ. Salida", key: "ultimaSalida", width: 20 },
         { header: "Registros", key: "registros", width: 15 },
       ];
 
       sheet.getRow(5).values = sheet.columns.map((c) => c.header);
       sheet.getRow(5).eachCell((cell) => {
-        if (cell.value) {
-          cell.style = styles.header;
-        }
+        if (cell.value) cell.style = styles.header;
       });
 
-      // Procesar datos por zona
       const zonas = [...new Set(lunas.map((l) => l.zona))].sort();
-      const resumenPorZona = zonas
-        .map((zona) => {
-          const lunasZona = lunas.filter((l) => l.zona === zona);
-          const tiposLuna = [...new Set(lunasZona.map((l) => l.tipo))];
+      zonas.forEach((zona) => {
+        const lunasZona = lunas.filter((l) => l.zona === zona);
+        const tiposLuna = [...new Set(lunasZona.map((l) => l.tipo))];
 
-          return tiposLuna.map((tipo) => {
-            const lunasTipo = lunasZona.filter((l) => l.tipo === tipo);
-            const movsTipo = movimientos.filter((m) =>
-              lunasTipo.some((l) => l._id.equals(m.referencia))
-            );
-            const movsOrdenados = [...movsTipo].sort(
-              (a, b) =>
-                new Date(b.fechaMovimiento) - new Date(a.fechaMovimiento)
-            );
-
-            return {
-              zona,
-              tipo,
-              ot: lunasTipo[0]?.ot || "N/A",
-              medidas: new Set(
-                lunasTipo.map((l) => `${l.esferico}/${l.cilindrico}`)
-              ).size,
-              stock: lunasTipo.reduce((sum, l) => sum + (l.stock || 0), 0),
-              ultimoMovimiento: movsOrdenados[0]?.fechaMovimiento,
-              tipoUltimoMovimiento: movsOrdenados[0]
-                ? movsOrdenados[0].tipoMovimiento === "ingreso"
-                  ? "Ingreso"
-                  : "Salida"
-                : "N/A",
-              subtipo: movsOrdenados[0]?.subtipo || "N/A",
-              ultimoIngreso: movsOrdenados.find(
-                (m) => m.tipoMovimiento === "ingreso"
-              )?.fechaMovimiento,
-              ultimaSalida: movsOrdenados.find(
-                (m) => m.tipoMovimiento === "salida"
-              )?.fechaMovimiento,
-              registros: lunasTipo.length,
-            };
-          });
-        })
-        .flat();
-
-      // Agregar datos por zona
-      resumenPorZona.forEach((item, index) => {
-        const row = sheet.addRow([
-          item.zona,
-          item.tipo,
-          item.ot,
-          item.medidas,
-          item.stock,
-          formatDate(item.ultimoMovimiento),
-          item.tipoUltimoMovimiento,
-          item.subtipo,
-          formatDate(item.ultimoIngreso),
-          formatDate(item.ultimaSalida),
-          item.registros,
-        ]);
-
-        row.eachCell((cell, colNumber) => {
-          if (!cell.style) cell.style = {};
-
-          // Aplicar estilos base
-          Object.assign(
-            cell.style,
-            colNumber === 5 || colNumber === 11
-              ? styles.number
-              : colNumber === 6 || colNumber === 9 || colNumber === 10
-              ? styles.date
-              : styles.data
+        tiposLuna.forEach((tipo) => {
+          const lunasTipo = lunasZona.filter((l) => l.tipo === tipo);
+          const movsTipo = movimientos.filter((m) =>
+            lunasTipo.some((l) => l._id.equals(m.referencia))
+          );
+          const movsOrdenados = [...movsTipo].sort(
+            (a, b) => new Date(b.fechaMovimiento) - new Date(a.fechaMovimiento)
           );
 
-          // Resaltar stock bajo
-          if (colNumber === 5) {
-            if (item.stock <= 5) {
+          const row = sheet.addRow([
+            zona,
+            tipo,
+            lunasTipo[0]?.ot || "N/A",
+            lunasTipo.reduce((sum, l) => sum + (l.stock || 0), 0),
+            formatDate(movsOrdenados[0]?.fechaMovimiento),
+            movsOrdenados[0]
+              ? movsOrdenados[0].tipoMovimiento === "ingreso"
+                ? "Ingreso"
+                : "Salida"
+              : "N/A",
+            lunasTipo.length,
+          ]);
+
+          row.eachCell((cell, colNumber) => {
+            if (!cell.style) cell.style = {};
+            Object.assign(
+              cell.style,
+              colNumber === 4 || colNumber === 7
+                ? styles.number
+                : colNumber === 5
+                ? styles.date
+                : styles.data
+            );
+
+            if (
+              colNumber === 4 &&
+              lunasTipo.reduce((sum, l) => sum + (l.stock || 0), 0) <= 5
+            )
               Object.assign(cell.style, styles.warningText);
-            }
-            if (item.stock === 0) {
+            if (
+              colNumber === 4 &&
+              lunasTipo.reduce((sum, l) => sum + (l.stock || 0), 0) === 0
+            )
               Object.assign(cell.style, styles.errorText);
-            }
-          }
-
-          // Resaltar tipo de movimiento
-          if (colNumber === 7) {
-            cell.style.font = {
-              color: {
-                argb:
-                  item.tipoUltimoMovimiento === "Ingreso"
-                    ? "FF00B050"
-                    : "FFC00000",
-              },
-              bold: true,
-            };
-          }
-
-          // Filas alternadas
-          if (index % 2 === 0) {
-            Object.assign(cell.style, styles.evenRow);
-          }
+          });
         });
       });
 
-      // Totales por zona
       const totalRow = sheet.addRow([
         "TOTAL GENERAL",
         "N/A",
         "N/A",
-        resumenPorZona.reduce((sum, item) => sum + item.medidas, 0),
-        resumenPorZona.reduce((sum, item) => sum + item.stock, 0),
+        lunas.reduce((sum, l) => sum + (l.stock || 0), 0),
         "N/A",
         "N/A",
-        "N/A",
-        "N/A",
-        "N/A",
-        resumenPorZona.reduce((sum, item) => sum + item.registros, 0),
+        lunas.length,
       ]);
 
       totalRow.eachCell((cell, colNumber) => {
-        if (!cell.style) cell.style = {};
-
-        if (colNumber === 1) {
-          Object.assign(cell.style, styles.total);
-          cell.style.alignment = { horizontal: "right" };
-          if (styles.total.font) {
-            cell.style.font = { ...styles.total.font, size: 12 };
-          }
-        } else if (colNumber === 5 || colNumber === 11) {
-          Object.assign(cell.style, styles.number, styles.total);
-          if (styles.total.font) {
-            cell.style.font = { ...styles.total.font, size: 12 };
-          }
-        } else {
-          Object.assign(cell.style, styles.data, styles.total);
-          if (styles.total.font) {
-            cell.style.font = { ...styles.total.font, size: 12 };
-          }
-        }
+        Object.assign(
+          cell.style,
+          colNumber === 4 || colNumber === 7 ? styles.number : styles.total
+        );
       });
     };
 
     // ========== HOJA INVENTARIO ==========
     const crearHojaInventario = () => {
       const sheet = workbook.addWorksheet("Inventario");
-
-      // Títulos
-      sheet.mergeCells("A1:K1");
+      sheet.mergeCells("A1:J1");
       sheet.getCell("A1").value = "DETALLE DE INVENTARIO DE LUNAS";
       sheet.getCell("A1").style = styles.title;
 
       const filtrosText = [
         fechaDesde && `Desde: ${formatDate(fechaDesde)}`,
         fechaHasta && `Hasta: ${formatDate(fechaHasta)}`,
-        tipoLuna && `Tipo: ${tipoLuna}`,
+        tipo && `Tipo: ${tipo}`,
         ot && `OT: ${ot}`,
         zona && `Zona: ${zona}`,
       ]
         .filter(Boolean)
         .join(" | ");
 
-      sheet.mergeCells("A2:K2");
+      sheet.mergeCells("A2:J2");
       sheet.getCell("A2").value = filtrosText || "Todos los registros";
       sheet.getCell("A2").style = {
         font: { italic: true, size: 11 },
         alignment: { horizontal: "center" },
       };
 
-      // Configurar columnas (sin el campo eje)
       sheet.columns = [
         { header: "Código", key: "codigo", width: 15 },
         { header: "Zona", key: "zona", width: 15 },
@@ -1053,14 +1177,11 @@ const exportarLunasAExcel = async (req, res) => {
 
       sheet.getRow(4).values = sheet.columns.map((c) => c.header);
       sheet.getRow(4).eachCell((cell) => {
-        if (cell.value) {
-          cell.style = styles.header;
-        }
+        if (cell.value) cell.style = styles.header;
       });
 
-      // Agregar datos
-      lunas.forEach((luna, index) => {
-        const row = sheet.addRow({
+      lunas.forEach((luna) => {
+        sheet.addRow({
           codigo: luna.codigo || luna._id.toString().substring(18, 24),
           zona: luna.zona || "N/A",
           tipo: luna.tipo,
@@ -1072,274 +1193,12 @@ const exportarLunasAExcel = async (req, res) => {
           registradoPor: formatUser(luna.registradoPor),
           estado: luna.stock > 0 ? "Disponible" : "Agotado",
         });
-
-        row.eachCell((cell, colNumber) => {
-          if (!cell.style) cell.style = {};
-
-          // Aplicar estilos base
-          Object.assign(
-            cell.style,
-            colNumber === 7
-              ? styles.number
-              : colNumber === 8
-              ? styles.date
-              : styles.data
-          );
-
-          // Resaltar estado
-          if (colNumber === 10) {
-            cell.style.font = {
-              color: { argb: luna.stock > 0 ? "FF00B050" : "FFC00000" },
-              bold: true,
-            };
-          }
-
-          // Resaltar stock bajo
-          if (colNumber === 7) {
-            if (luna.stock <= 5) {
-              Object.assign(cell.style, styles.warningText);
-            }
-            if (luna.stock === 0) {
-              Object.assign(cell.style, styles.errorText);
-            }
-          }
-
-          // Filas alternadas
-          if (index % 2 === 0) {
-            Object.assign(cell.style, styles.evenRow);
-          }
-        });
       });
-
-      // Totales por zona
-      const zonas = [...new Set(lunas.map((l) => l.zona))].sort();
-      zonas.forEach((zona) => {
-        const total = lunas
-          .filter((l) => l.zona === zona)
-          .reduce((sum, l) => sum + (l.stock || 0), 0);
-        const row = sheet.addRow({
-          zona: `TOTAL ZONA ${zona}`,
-          stock: total,
-        });
-
-        row.getCell(1).style = {
-          ...styles.total,
-          alignment: { horizontal: "right" },
-        };
-        row.getCell(7).style = {
-          ...styles.number,
-          ...styles.total,
-        };
-        sheet.mergeCells(`A${row.number}:F${row.number}`);
-      });
-
-      // Total general
-      const totalGeneral = lunas.reduce((sum, l) => sum + (l.stock || 0), 0);
-      const totalRow = sheet.addRow({
-        zona: "TOTAL GENERAL DEL INVENTARIO",
-        stock: totalGeneral,
-      });
-
-      totalRow.getCell(1).style = {
-        ...styles.total,
-        font: { ...styles.total.font, size: 12 },
-        alignment: { horizontal: "right" },
-      };
-      totalRow.getCell(7).style = {
-        ...styles.number,
-        ...styles.total,
-        font: { ...styles.total.font, size: 12 },
-      };
-      sheet.mergeCells(`A${totalRow.number}:F${totalRow.number}`);
-    };
-
-    // ========== HOJA MOVIMIENTOS ==========
-    const crearHojaMovimientos = () => {
-      const sheet = workbook.addWorksheet("Movimientos");
-
-      // Títulos
-      sheet.mergeCells("A1:L1");
-      sheet.getCell("A1").value = "HISTORIAL DE MOVIMIENTOS";
-      sheet.getCell("A1").style = styles.title;
-
-      const filtrosText = [
-        fechaDesde && `Desde: ${formatDate(fechaDesde)}`,
-        fechaHasta && `Hasta: ${formatDate(fechaHasta)}`,
-        tipoLuna && `Tipo: ${tipoLuna}`,
-        ot && `OT: ${ot}`,
-        zona && `Zona: ${zona}`,
-      ]
-        .filter(Boolean)
-        .join(" | ");
-
-      sheet.mergeCells("A2:L2");
-      sheet.getCell("A2").value = filtrosText || "Todos los movimientos";
-      sheet.getCell("A2").style = {
-        font: { italic: true, size: 11 },
-        alignment: { horizontal: "center" },
-      };
-
-      // Configurar columnas (con zona y sin eje)
-      sheet.columns = [
-        { header: "Correlativo", key: "correlativo", width: 15 },
-        { header: "Fecha Movimiento", key: "fecha", width: 18 },
-        { header: "Tipo", key: "tipo", width: 12 },
-        { header: "Subtipo", key: "subtipo", width: 15 },
-        { header: "Zona", key: "zona", width: 15 },
-        { header: "OT", key: "ot", width: 15 },
-        { header: "Tipo Luna", key: "tipoLuna", width: 20 },
-        { header: "Esférico", key: "esferico", width: 12 },
-        { header: "Cilíndrico", key: "cilindrico", width: 12 },
-        { header: "Cantidad", key: "cantidad", width: 12 },
-        { header: "Registrado Por", key: "registradoPor", width: 25 },
-        { header: "Stock Post", key: "stockPost", width: 12 },
-      ];
-
-      sheet.getRow(4).values = sheet.columns.map((c) => c.header);
-      sheet.getRow(4).eachCell((cell) => {
-        if (cell.value) {
-          cell.style = styles.header;
-        }
-      });
-
-      // Agregar datos
-      movimientos.forEach((mov, index) => {
-        const luna = lunas.find((l) => l._id.equals(mov.referencia));
-        const stockPost = luna ? getStockPost(mov, luna) : "N/A";
-
-        const row = sheet.addRow({
-          correlativo: mov.correlativo || "N/A",
-          fecha: formatDate(mov.fechaMovimiento || mov.createdAt),
-          tipo: mov.tipoMovimiento === "ingreso" ? "Ingreso" : "Salida",
-          subtipo: mov.subtipo || "N/A",
-          zona: luna?.zona || "N/A",
-          ot: mov.documentoRelacionado?.referencia || luna?.ot || "N/A",
-          tipoLuna: luna?.tipo || "N/A",
-          esferico: luna?.esferico || "N/A",
-          cilindrico: luna?.cilindrico || "N/A",
-          cantidad: mov.cantidad,
-          registradoPor: formatUser(mov.registradoPor),
-          stockPost: stockPost,
-        });
-
-        row.eachCell((cell, colNumber) => {
-          if (!cell.style) cell.style = {};
-
-          // Aplicar estilos base
-          Object.assign(
-            cell.style,
-            colNumber === 2
-              ? styles.date
-              : colNumber === 10 || colNumber === 12
-              ? styles.number
-              : styles.data
-          );
-
-          // Resaltar tipo de movimiento
-          if (colNumber === 3) {
-            cell.style.font = {
-              color: {
-                argb:
-                  mov.tipoMovimiento === "ingreso" ? "FF00B050" : "FFC00000",
-              },
-              bold: true,
-            };
-          }
-
-          // Resaltar stock bajo
-          if (colNumber === 12 && stockPost !== "N/A") {
-            if (stockPost <= 5) {
-              Object.assign(cell.style, styles.warningText);
-            }
-            if (stockPost === 0) {
-              Object.assign(cell.style, styles.errorText);
-            }
-          }
-
-          // Filas alternadas
-          if (index % 2 === 0) {
-            Object.assign(cell.style, styles.evenRow);
-          }
-        });
-      });
-
-      // Totales por zona
-      const zonas = [
-        ...new Set(
-          movimientos
-            .map((m) => {
-              const luna = lunas.find((l) => l._id.equals(m.referencia));
-              return luna?.zona;
-            })
-            .filter(Boolean)
-        ),
-      ].sort();
-
-      zonas.forEach((zona) => {
-        const movsZona = movimientos.filter((m) => {
-          const luna = lunas.find((l) => l._id.equals(m.referencia));
-          return luna?.zona === zona;
-        });
-
-        const totalIngresos = movsZona
-          .filter((m) => m.tipoMovimiento === "ingreso")
-          .reduce((sum, m) => sum + (m.cantidad || 0), 0);
-
-        const totalSalidas = movsZona
-          .filter((m) => m.tipoMovimiento === "salida")
-          .reduce((sum, m) => sum + (m.cantidad || 0), 0);
-
-        const totalRow = sheet.addRow({
-          zona: `TOTAL ZONA ${zona}`,
-          cantidad: totalIngresos - totalSalidas,
-        });
-
-        totalRow.getCell(1).value = `TOTAL ZONA ${zona}`;
-        totalRow.getCell(1).style = {
-          ...styles.total,
-          alignment: { horizontal: "right" },
-        };
-        totalRow.getCell(10).style = {
-          ...styles.number,
-          ...styles.total,
-        };
-        sheet.mergeCells(`A${totalRow.number}:I${totalRow.number}`);
-      });
-
-      // Total general
-      const totalIngresos = movimientos
-        .filter((m) => m.tipoMovimiento === "ingreso")
-        .reduce((sum, m) => sum + (m.cantidad || 0), 0);
-
-      const totalSalidas = movimientos
-        .filter((m) => m.tipoMovimiento === "salida")
-        .reduce((sum, m) => sum + (m.cantidad || 0), 0);
-
-      const totalRow = sheet.addRow({
-        zona: "TOTAL NETO",
-        cantidad: totalIngresos - totalSalidas,
-      });
-
-      totalRow.getCell(1).value = "TOTAL NETO";
-      totalRow.getCell(1).style = {
-        ...styles.total,
-        alignment: { horizontal: "right" },
-        font: { ...styles.total.font, size: 12 },
-      };
-      totalRow.getCell(10).style = {
-        ...styles.number,
-        ...styles.total,
-        font: { ...styles.total.font, size: 12 },
-      };
-      sheet.mergeCells(`A${totalRow.number}:I${totalRow.number}`);
     };
 
     // ========== CREAR HOJAS ==========
     crearHojaResumen();
     crearHojaInventario();
-    if (movimientos.length > 0) {
-      crearHojaMovimientos();
-    }
 
     // ========== ENVIAR ARCHIVO ==========
     const fileName = `Reporte_Lunas_${
@@ -1368,12 +1227,12 @@ const exportarLunasAExcel = async (req, res) => {
 
 module.exports = {
   registrarLuna,
-  obtenerTiposDeLunas,
   obtenerMedidasPorIdLuna,
   obtenerLunas,
   obtenerLunaPorId,
   actualizarStock,
-  obtenerStockPorTipo,
+  obtenerReporteStock,
   eliminarLuna,
   exportarLunasAExcel,
+  obtenerInsightsIA,
 };
