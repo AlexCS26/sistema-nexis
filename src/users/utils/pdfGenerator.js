@@ -2,37 +2,65 @@ const QRCode = require("qrcode");
 
 let puppeteer;
 let chromium;
-let usingChromiumMin = false;
 
-// Detectar entorno: Koyeb o local
-const isServerless = !!process.env.KOYEB;
+// Detectar entorno de manera más agresiva
+const isServerless =
+  !!process.env.KOYEB ||
+  !!process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  !!process.env.VERCEL ||
+  !!process.env.NETLIFY ||
+  process.env.NODE_ENV === "production";
+
+console.log("🔍 Detección de entorno:", {
+  KOYEB: process.env.KOYEB,
+  NODE_ENV: process.env.NODE_ENV,
+  isServerless: isServerless,
+});
 
 if (isServerless) {
   try {
+    // Intentar con chromium-min primero (más ligero)
     chromium = require("@sparticuz/chromium-min");
     puppeteer = require("puppeteer-core");
-    usingChromiumMin = true;
-    console.log(
-      "🟣 Modo Koyeb (serverless) detectado → usando puppeteer-core + chromium-min"
-    );
+    console.log("🟣 Usando puppeteer-core + @sparticuz/chromium-min");
   } catch (error) {
-    console.log("⚠️  Error cargando chromium-min, usando puppeteer normal");
-    puppeteer = require("puppeteer");
+    console.log("❌ chromium-min no disponible, intentando con chromium...");
+    try {
+      chromium = require("@sparticuz/chromium");
+      puppeteer = require("puppeteer-core");
+      console.log("🟣 Usando puppeteer-core + @sparticuz/chromium");
+    } catch (error2) {
+      console.log(
+        "❌ Chromium no disponible, usando puppeteer normal (puede fallar)"
+      );
+      puppeteer = require("puppeteer");
+    }
   }
 } else {
   puppeteer = require("puppeteer");
-  console.log("🟢 Modo local detectado → usando puppeteer normal");
+  console.log("🟢 Modo local → puppeteer normal");
 }
 
 const generarComprobantePDF = async (venta, tipo = "FACTURA ELECTRÓNICA") => {
   let browser;
 
   try {
-    // Opciones según entorno
     let launchOptions;
+    let executablePath;
 
-    if (isServerless && usingChromiumMin) {
-      // Configuración específica para Koyeb con chromium-min
+    if (isServerless && chromium) {
+      // FORZAR modo serverless en Koyeb
+      console.log("🚀 Configurando para entorno serverless...");
+
+      try {
+        executablePath = await chromium.executablePath();
+        console.log("✅ Chromium executable path:", executablePath);
+      } catch (error) {
+        console.log("❌ Error obteniendo executablePath:", error.message);
+        // Fallback a Chrome conocido
+        executablePath = "/usr/bin/chromium-browser";
+      }
+
       launchOptions = {
         args: [
           "--no-sandbox",
@@ -40,37 +68,36 @@ const generarComprobantePDF = async (venta, tipo = "FACTURA ELECTRÓNICA") => {
           "--disable-dev-shm-usage",
           "--disable-gpu",
           "--single-process",
+          "--no-zygote",
+          "--disable-web-security",
+          "--disable-features=VizDisplayCompositor",
+          "--disable-software-rasterizer",
         ],
         defaultViewport: {
           width: 794,
           height: 1123,
         },
-        executablePath: await chromium.executablePath(),
+        executablePath: executablePath,
         headless: true,
         ignoreHTTPSErrors: true,
       };
     } else {
-      // Configuración local o fallback
+      // Modo local
+      console.log("💻 Configurando para entorno local...");
       launchOptions = {
         headless: true,
         args: ["--no-sandbox", "--disable-setuid-sandbox"],
       };
     }
 
-    console.log(
-      "🔧 Launch options:",
-      JSON.stringify({
-        isServerless,
-        usingChromiumMin,
-        executablePath: launchOptions.executablePath ? "defined" : "undefined",
-      })
-    );
+    console.log("🔧 Launch options preparadas, lanzando browser...");
 
-    // Lanzar navegador
+    // Lanzar navegador con timeout
     browser = await puppeteer.launch(launchOptions);
-    const page = await browser.newPage();
+    console.log("✅ Browser lanzado exitosamente");
 
-    await page.setViewport({ width: 794, height: 1123 }); // A4
+    const page = await browser.newPage();
+    await page.setViewport({ width: 794, height: 1123 });
 
     const formatSigned = (val) =>
       val != null ? (val >= 0 ? `+${val.toFixed(2)}` : val.toFixed(2)) : "-";
