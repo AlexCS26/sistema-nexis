@@ -13,7 +13,11 @@ const {
 } = require("../../../utils/responseUtils");
 const VentaService = require("../services/ventaService");
 const { updateProductStock } = require("../../../utils/updateProductStock");
-const { generarComprobantePDF } = require("../../../utils/pdfGenerator");
+const nubefactService = require("../../../services/nubefact-service");
+const {
+  generarComprobantePDF,
+  obtenerPDFComprobanteExistente,
+} = require("../../../utils/pdfGenerator");
 
 class VentaController {
   /**
@@ -386,7 +390,7 @@ class VentaController {
       // Buscar la venta con relaciones necesarias
       const venta = await Venta.findById(id)
         .select(
-          "ot paciente items vendedora recojos totalVenta pagos saldoPendiente fechaVenta serie numero"
+          "ot paciente items vendedora recojos totalVenta pagos saldoPendiente fechaVenta serie numero nubefactResponse"
         )
         .populate("paciente")
         .populate("items.productId")
@@ -405,11 +409,70 @@ class VentaController {
         ? `Venta_${ot}.pdf`
         : `Venta_${venta._id.toString().slice(-6)}.pdf`;
 
-      // 🔹 Generar PDF usando Nubefact
-      const pdfBuffer = await generarComprobantePDF(
-        venta,
-        "BOLETA DE VENTA ELECTRÓNICA"
-      );
+      let pdfBuffer;
+
+      // 🔹 ESTRATEGIA MEJORADA: Primero verificar si ya existe
+      try {
+        // 1. Si ya tenemos la respuesta de Nubefact guardada
+        if (venta.nubefactResponse) {
+          console.log("📄 Obteniendo PDF existente de Nubefact...");
+          pdfBuffer = await obtenerPDFComprobanteExistente(
+            venta.nubefactResponse
+          );
+        }
+        // 2. Si no tenemos respuesta guardada, PRIMERO consultar si existe
+        else {
+          console.log(
+            "🔍 Verificando si el comprobante ya existe en Nubefact..."
+          );
+
+          const serie = venta.serie || "BBB1";
+          const numero = venta.numero || venta.ot;
+
+          try {
+            // Intentar consultar el comprobante existente
+            const comprobanteExistente =
+              await nubefactService.consultarComprobante(2, serie, numero);
+            console.log(
+              "✅ Comprobante encontrado en Nubefact, obteniendo PDF..."
+            );
+            pdfBuffer = await obtenerPDFComprobanteExistente(
+              comprobanteExistente
+            );
+
+            // 🔹 Guardar la respuesta para futuras consultas
+            await Venta.findByIdAndUpdate(id, {
+              nubefactResponse: comprobanteExistente,
+            });
+          } catch (consultaError) {
+            // Si no existe (error 404), generar nuevo comprobante
+            if (
+              consultaError.message.includes("no existe") ||
+              consultaError.message.includes("404")
+            ) {
+              console.log(
+                "🔄 Comprobante no existe, generando nuevo en Nubefact..."
+              );
+              const resultado = await generarComprobantePDF(
+                venta,
+                "BOLETA DE VENTA ELECTRÓNICA"
+              );
+              pdfBuffer = resultado.pdf;
+
+              // 🔹 Guardar la respuesta para futuras consultas
+              await Venta.findByIdAndUpdate(id, {
+                nubefactResponse: resultado.comprobante,
+              });
+            } else {
+              // Si es otro error, relanzarlo
+              throw consultaError;
+            }
+          }
+        }
+      } catch (error) {
+        console.error("❌ Error en el proceso de PDF:", error.message);
+        throw error;
+      }
 
       // 🔹 Configurar headers ANTES de enviar
       res.setHeader("Content-Type", "application/pdf");
