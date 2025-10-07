@@ -2,16 +2,23 @@ const QRCode = require("qrcode");
 
 let puppeteer;
 let chromium;
+let usingChromiumMin = false;
 
-// Detectar entorno: Kyob o local
-const isServerless = !!process.env.KOYEB || process.env.KYOB === "true";
+// Detectar entorno: Koyeb o local
+const isServerless = !!process.env.KOYEB;
 
 if (isServerless) {
-  chromium = require("@sparticuz/chromium");
-  puppeteer = require("puppeteer-core");
-  console.log(
-    "🟣 Modo Kyob (serverless) detectado → usando puppeteer-core + chromium"
-  );
+  try {
+    chromium = require("@sparticuz/chromium-min");
+    puppeteer = require("puppeteer-core");
+    usingChromiumMin = true;
+    console.log(
+      "🟣 Modo Koyeb (serverless) detectado → usando puppeteer-core + chromium-min"
+    );
+  } catch (error) {
+    console.log("⚠️  Error cargando chromium-min, usando puppeteer normal");
+    puppeteer = require("puppeteer");
+  }
 } else {
   puppeteer = require("puppeteer");
   console.log("🟢 Modo local detectado → usando puppeteer normal");
@@ -22,18 +29,42 @@ const generarComprobantePDF = async (venta, tipo = "FACTURA ELECTRÓNICA") => {
 
   try {
     // Opciones según entorno
-    const launchOptions = isServerless
-      ? {
-          args: chromium.args,
-          defaultViewport: chromium.defaultViewport,
-          executablePath: await chromium.executablePath(),
-          headless: chromium.headless,
-          ignoreHTTPSErrors: true,
-        }
-      : {
-          headless: true,
-          args: ["--no-sandbox", "--disable-setuid-sandbox"],
-        };
+    let launchOptions;
+
+    if (isServerless && usingChromiumMin) {
+      // Configuración específica para Koyeb con chromium-min
+      launchOptions = {
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--single-process",
+        ],
+        defaultViewport: {
+          width: 794,
+          height: 1123,
+        },
+        executablePath: await chromium.executablePath(),
+        headless: true,
+        ignoreHTTPSErrors: true,
+      };
+    } else {
+      // Configuración local o fallback
+      launchOptions = {
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      };
+    }
+
+    console.log(
+      "🔧 Launch options:",
+      JSON.stringify({
+        isServerless,
+        usingChromiumMin,
+        executablePath: launchOptions.executablePath ? "defined" : "undefined",
+      })
+    );
 
     // Lanzar navegador
     browser = await puppeteer.launch(launchOptions);
